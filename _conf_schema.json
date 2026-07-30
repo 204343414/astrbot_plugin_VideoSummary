@@ -1,0 +1,119 @@
+{
+  "gemini": {
+    "description": "Gemini 设置",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "Gemini Provider ID（可选）",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "留空时使用当前会话 Provider；必须是 AstrBot 的 Google Gemini Provider。"
+      },
+      "model": {
+        "description": "Gemini 模型名（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空时复用 Provider 模型。建议使用支持视频理解的 Gemini 模型。"
+      },
+      "file_poll_timeout_seconds": {
+        "description": "视频文件处理等待超时秒数",
+        "type": "int",
+        "default": 180
+      },
+      "file_poll_interval_seconds": {
+        "description": "视频文件处理轮询间隔秒数",
+        "type": "float",
+        "default": 3
+      }
+    }
+  },
+  "limits": {
+    "description": "限制",
+    "type": "object",
+    "items": {
+      "max_duration_minutes": {
+        "description": "最大视频时长（分钟）",
+        "type": "float",
+        "default": 10
+      },
+      "max_file_size_mb": {
+        "description": "最大下载文件大小 MB",
+        "type": "float",
+        "default": 120
+      },
+      "daily_limit_per_user": {
+        "description": "每人每日次数，0 表示不限制",
+        "type": "int",
+        "default": 3
+      },
+      "max_concurrent_jobs": {
+        "description": "最大并发分析任务数",
+        "type": "int",
+        "default": 1
+      }
+    }
+  },
+  "access_control": {
+    "description": "访问控制",
+    "type": "object",
+    "items": {
+      "public_domestic_only": {
+        "description": "普通用户仅允许国内平台 URL",
+        "type": "bool",
+        "default": true
+      },
+      "operator_openids": {
+        "description": "操作员 OpenID/QQ号，多个用逗号或换行分隔",
+        "type": "text",
+        "default": ""
+      },
+      "allowed_group_openids": {
+        "description": "白名单群 group_openid/群号，多个用逗号或换行分隔",
+        "type": "text",
+        "default": ""
+      },
+      "allowed_qqofficial_instance_ids": {
+        "description": "白名单 QQ 官方平台实例 ID，例如 default_102824564 或 102824564",
+        "type": "text",
+        "default": ""
+      }
+    }
+  },
+  "prompts": {
+    "description": "提示词",
+    "type": "object",
+    "items": {
+      "default_task_prompt": {
+        "description": "默认任务提示词",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "markdown",
+        "default": "请总结这个视频的主要内容，提取关键信息、重要画面、人物/事件、结论，并给出简短时间线。"
+      },
+      "tail_instruction_prompt": {
+        "description": "末尾安全与格式提示词",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "markdown",
+        "default": "\n\n---\n请严格遵守以下输出规则：\n1. 先判断视频内容是否适合总结。如果包含政治敏感、色情/性暗示、未成年人性相关、血腥暴力、恐怖主义、违法犯罪教学、仇恨骚扰、开盒隐私或其它可能导致平台风险的内容，只输出：SAFE=false、简短原因，不要复述细节。\n2. 如果内容适合总结，输出 SAFE=true，并给出：一句话概括、要点列表、时间线、可核实信息/不确定信息。\n3. 不要编造看不到/听不到的信息；不确定就明确说不确定。\n4. 使用中文，保持克制、客观、适合在 QQ 群展示。\n5. 输出纯文本，不要 Markdown 表格。"
+      }
+    }
+  },
+  "output": {
+    "description": "输出卡片",
+    "type": "object",
+    "items": {
+      "card_title": {
+        "description": "卡片标题",
+        "type": "string",
+        "default": "AI 视频内容摘要"
+      },
+      "disclaimer": {
+        "description": "免责声明",
+        "type": "text",
+        "default": "您请求的视频内容摘要已生成。以下内容由 AI 基于可见/可听信息自动整理，仅供参考，不代表事实核验或平台立场。"
+      }
+    }
+  }
+}
