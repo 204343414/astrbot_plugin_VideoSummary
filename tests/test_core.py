@@ -85,5 +85,12 @@ class VideoSummaryCoreTests(unittest.TestCase):
         self.assertEqual(self.mod.VideoSummaryPlugin._parse_values("a,b，c\nd"), {"a", "b", "c", "d"})
 
 
+    def test_split_question_and_url_from_raw_command_with_question(self):
+        plugin = self.mod.VideoSummaryPlugin.__new__(self.mod.VideoSummaryPlugin)
+        raw = "/视频分析 这个视频内容 [https://www.bilibili.com/video/BV1kW411d7cD?spm_id_from=1](https://www.bilibili.com/video/BV1kW411d7cD?spm_id_from=1)"
+        question, url = plugin._split_question_and_url(raw)
+        self.assertEqual(question, "这个视频内容")
+        self.assertEqual(url, "https://www.bilibili.com/video/BV1kW411d7cD/")
+
 if __name__ == "__main__":
     unittest.main()

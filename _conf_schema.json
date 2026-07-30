@@ -16,6 +16,18 @@
         "default": "",
         "hint": "留空时复用 Provider 模型。建议使用支持视频理解的 Gemini 模型。"
       },
+      "api_base": {
+        "description": "Gemini API Base URL（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "默认留空，使用 Google Gemini 官方地址。只有在你的代理明确支持 Gemini Files API 上传接口 /upload/v1beta/files 时才填写。"
+      },
+      "use_provider_api_base": {
+        "description": "继承 AstrBot Gemini Provider 的 api_base",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭，避免把 OpenAI 兼容代理或不支持 Files API 的 Gemini 代理用于视频上传。若你的 Provider api_base 明确支持 Gemini Files API，可开启。"
+      },
       "file_poll_timeout_seconds": {
         "description": "视频文件处理等待超时秒数",
         "type": "int",

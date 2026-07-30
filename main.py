@@ -40,7 +40,7 @@ PLUGIN_NAME = "astrbot_plugin_VideoSummary"
     PLUGIN_NAME,
     "204343414",
     "Gemini 视频内容分析与安全摘要",
-    "0.1.0",
+    "0.1.1",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -71,6 +71,8 @@ class VideoSummaryPlugin(Star):
         gemini = config.get("gemini", {}) or {}
         self.provider_id = str(gemini.get("provider_id", "") or "").strip()
         self.model = str(gemini.get("model", "") or "").strip()
+        self.api_base_override = str(gemini.get("api_base", "") or "").strip() or None
+        self.use_provider_api_base = bool(gemini.get("use_provider_api_base", False))
         self.file_poll_timeout_seconds = max(int(gemini.get("file_poll_timeout_seconds", 180)), 30)
         self.file_poll_interval_seconds = max(float(gemini.get("file_poll_interval_seconds", 3)), 1.0)
 
@@ -321,12 +323,19 @@ class VideoSummaryPlugin(Star):
             raise RuntimeError("未能从 Gemini Provider 读取 API key")
         if "gemini" not in model.lower():
             raise RuntimeError(f"当前 Provider 模型不像 Gemini: {model}。请配置 gemini.provider_id/model")
-        api_base = getattr(provider, "api_base", None) or getattr(provider, "provider_config", {}).get("api_base", None)
+        provider_api_base = getattr(provider, "api_base", None) or getattr(provider, "provider_config", {}).get("api_base", None)
+        api_base = self.api_base_override or (provider_api_base if self.use_provider_api_base else None)
         timeout = int(getattr(provider, "timeout", 180) or 180)
         return api_key, model, api_base, timeout
 
     async def _upload_and_wait_file(self, client, video_path: Path):
-        uploaded = await asyncio.to_thread(client.files.upload, file=str(video_path))
+        try:
+            uploaded = await asyncio.to_thread(client.files.upload, file=str(video_path))
+        except KeyError as exc:
+            raise RuntimeError(
+                "Gemini Files API 上传初始化失败：当前 api_base/代理可能不支持 /upload/v1beta/files。"
+                "请优先留空 gemini.api_base，并关闭 use_provider_api_base；若必须走代理，请确认代理支持 Gemini Files API。"
+            ) from exc
         name = getattr(uploaded, "name", "")
         deadline = time.monotonic() + self.file_poll_timeout_seconds
         while True:
@@ -371,11 +380,23 @@ class VideoSummaryPlugin(Star):
             raise RuntimeError("Gemini 未返回文本结果")
         return text, used
 
+    @staticmethod
+    def _strip_command_prefix(text: str) -> str:
+        text = str(text or "").strip()
+        # Works for raw strings like "/视频分析 ..." or after wake-prefix removal.
+        for prefix in ("/视频分析", "视频分析"):
+            if text.startswith(prefix):
+                return text[len(prefix):].strip()
+        return text
+
     def _split_question_and_url(self, text: str) -> tuple[str, str]:
+        text = self._strip_command_prefix(text)
         url = self._extract_first_url(text)
         question = str(text or "")
         if url:
+            # Remove both raw URL and markdown link forms that point to it.
             question = question.replace(url, " ", 1)
+            question = re.sub(r"\[[^\]]*\]\(\s*" + re.escape(url) + r"\s*\)", " ", question)
         question = re.sub(r"\[[^\]]*\]\(\s*\)", " ", question)
         question = re.sub(r"\s+", " ", question).strip(" +，,。")
         return question, self._normalize_bilibili_url(url)
@@ -434,7 +455,14 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
             yield event.plain_result(f"今日视频分析次数已用完（{self.daily_limit_per_user} 次）。")
             return
 
-        question, url = self._split_question_and_url(str(text or ""))
+        raw_text = str(text or "")
+        question, url = self._split_question_and_url(raw_text)
+        if not url:
+            try:
+                raw_text = str(event.get_message_str() or getattr(event, "message_str", "") or "")
+            except Exception:
+                raw_text = str(getattr(event, "message_str", "") or "")
+            question, url = self._split_question_and_url(raw_text)
         if not url:
             yield event.plain_result("请提供包含 http/https 的视频链接。")
             return

@@ -26,3 +26,28 @@ AstrBot v4.26.x 的 ProviderRequest 支持图片与音频输入，但没有一�
 - `access_control.public_domestic_only`：开启后普通用户只允许国内平台 URL；国外/高风险站点仅白名单/管理员/操作员可用。
 
 次数在视频成功下载并进入 Gemini 流程后扣除；URL 解析失败、下载失败、超过时长/大小不扣。
+
+## URL 提取说明
+
+如果 AstrBot 没有把整段参数作为 GreedyStr 传入，插件会回退读取完整消息原文再提取第一条 URL。因此下面这种前面带问题、后面带 Markdown 链接的格式也支持：
+
+```text
+/视频分析 这个视频内容 [https://www.bilibili.com/video/BVxxxx](https://www.bilibili.com/video/BVxxxx)
+```
+
+## Gemini Files API 注意
+
+视频分析依赖 Gemini Files API 上传视频。默认情况下，插件只复用 AstrBot Gemini Provider 的 API Key 和模型，不继承 Provider 的 `api_base`，避免把不支持 Files API 的 OpenAI 兼容代理用于视频上传。
+
+如需走代理，请确认代理支持 Gemini 原生上传接口 `/upload/v1beta/files`，然后配置：
+
+```json
+{
+  "gemini": {
+    "api_base": "https://your-gemini-compatible-base",
+    "use_provider_api_base": false
+  }
+}
+```
+
+如果看到 `Upload URL did not returned from the create file request`，通常就是当前 `api_base`/代理不支持 Gemini Files API。
