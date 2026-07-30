@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import wave
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import time
 from datetime import date
 from pathlib import Path
 
+import aiohttp
 import yt_dlp
 from google import genai
 from google.genai import types
@@ -40,7 +42,7 @@ PLUGIN_NAME = "astrbot_plugin_VideoSummary"
     PLUGIN_NAME,
     "204343414",
     "Gemini 视频内容分析与安全摘要",
-    "0.1.1",
+    "0.1.2",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -95,6 +97,12 @@ class VideoSummaryPlugin(Star):
             )
         ).strip()
         self.card_title = str(output.get("card_title", "AI 视频内容摘要")).strip()
+
+        stt = config.get("stt", {}) or {}
+        self.stt_enabled = bool(stt.get("enabled", False))
+        self.stt_api_base_url = str(stt.get("api_base_url", "") or "").strip().rstrip("/")
+        self.stt_api_key = str(stt.get("api_key", "") or "").strip()
+        self.stt_model = str(stt.get("model", "whisper-1") or "whisper-1").strip()
 
         self._cleanup_stale_temp()
         logger.info(
@@ -500,6 +508,135 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                         path.unlink()
                     except OSError:
                         pass
+
+    @staticmethod
+    def _mask_secret(value: str) -> str:
+        value = str(value or "")
+        if not value:
+            return "<empty>"
+        if len(value) <= 8:
+            return value[:2] + "***"
+        return value[:4] + "..." + value[-4:]
+
+    @staticmethod
+    def _short_error(exc: BaseException, limit: int = 240) -> str:
+        text = str(exc) or type(exc).__name__
+        text = re.sub(r"[A-Za-z0-9_\-]{24,}", lambda m: m.group(0)[:6] + "..." + m.group(0)[-4:], text)
+        return f"{type(exc).__name__}: {text[:limit]}"
+
+    def _make_silent_wav(self) -> Path:
+        path = self.temp_dir / f"stt_probe_{int(time.time() * 1000)}.wav"
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 16000)
+        return path
+
+    async def _probe_openai_stt(self) -> str:
+        if not self.stt_enabled:
+            return "SKIP：stt.enabled=false"
+        if not self.stt_api_base_url or not self.stt_api_key:
+            return "SKIP：stt.api_base_url 或 stt.api_key 未配置"
+        wav = self._make_silent_wav()
+        try:
+            form = aiohttp.FormData()
+            form.add_field("model", self.stt_model)
+            form.add_field(
+                "file",
+                wav.read_bytes(),
+                filename="stt_probe.wav",
+                content_type="audio/wav",
+            )
+            timeout = aiohttp.ClientTimeout(total=45, connect=10)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.post(
+                    f"{self.stt_api_base_url}/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {self.stt_api_key}"},
+                    data=form,
+                ) as resp:
+                    body = await resp.text()
+                    if resp.status < 400:
+                        return f"OK：HTTP {resp.status}，返回 {body[:120]}"
+                    return f"FAIL：HTTP {resp.status}，返回 {body[:180]}"
+        finally:
+            try:
+                wav.unlink()
+            except OSError:
+                pass
+
+    async def _probe_gemini_text(self, client, model: str) -> str:
+        try:
+            resp = await asyncio.to_thread(
+                client.models.generate_content,
+                model=model,
+                contents="请只回复 PONG",
+            )
+            text = str(getattr(resp, "text", "") or "").strip()
+            return f"OK：{text[:80] or '<empty>'}"
+        except Exception as exc:
+            return "FAIL：" + self._short_error(exc)
+
+    async def _probe_gemini_file_api(self, client) -> str:
+        probe = self.temp_dir / f"gemini_file_probe_{int(time.time() * 1000)}.txt"
+        probe.write_text("hello", encoding="utf-8")
+        try:
+            uploaded = await self._upload_and_wait_file(client, probe)
+            name = str(getattr(uploaded, "name", "") or "")
+            uri = str(getattr(uploaded, "uri", "") or "")
+            return f"OK：name={name or '<none>'} uri={uri[:48] or '<none>'}"
+        except Exception as exc:
+            return "FAIL：" + self._short_error(exc)
+        finally:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+
+    @filter.command("视频分析自检")
+    async def diagnostics(self, event: AstrMessageEvent, text: GreedyStr = ""):
+        """自检 Gemini Files API、字幕信息、STT 中转站等链路。"""
+        event.stop_event()
+        lines: list[str] = ["🧪 视频分析插件自检"]
+        raw = str(text or "")
+        _question, url = self._split_question_and_url(raw)
+        if not url:
+            try:
+                _question, url = self._split_question_and_url(event.get_message_str())
+            except Exception:
+                pass
+        lines.append(f"URL：{url or '未提供'}")
+
+        try:
+            api_key, model, api_base, timeout = await self._resolve_gemini_provider(event)
+            lines.append(f"Gemini Provider：OK model={model} key={self._mask_secret(api_key)}")
+            lines.append(f"Gemini api_base：{api_base or 'Google 官方默认'} timeout={timeout}s")
+            client = genai.Client(api_key=api_key, http_options=types.HttpOptions(base_url=api_base, timeout=timeout * 1000))
+            lines.append("Gemini 文本生成：" + await self._probe_gemini_text(client, model))
+            lines.append("Gemini Files API：" + await self._probe_gemini_file_api(client))
+        except Exception as exc:
+            lines.append("Gemini Provider：FAIL " + self._short_error(exc))
+
+        if url:
+            try:
+                info = await self._extract_info(url)
+                duration = float(info.get("duration") or 0)
+                domestic = self._is_domestic_url_or_info(url, info)
+                subs = sorted((info.get("subtitles") or {}).keys())[:12]
+                auto_subs = sorted((info.get("automatic_captions") or {}).keys())[:12]
+                lines.append(
+                    f"yt-dlp 元信息：OK extractor={info.get('extractor') or info.get('extractor_key')} duration={duration/60:.1f}min domestic={domestic}"
+                )
+                lines.append(f"字幕：manual={subs or '无'} auto={auto_subs or '无'}")
+                if duration and duration > self.max_duration_minutes * 60:
+                    lines.append(f"限制：WARN 视频超过 max_duration_minutes={self.max_duration_minutes}")
+                else:
+                    lines.append("限制：OK 时长未超限或未知")
+            except Exception as exc:
+                lines.append("yt-dlp 元信息：FAIL " + self._short_error(exc))
+
+        lines.append("OpenAI 兼容 STT：" + await self._probe_openai_stt())
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         self._save_usage()

@@ -51,3 +51,21 @@ AstrBot v4.26.x 的 ProviderRequest 支持图片与音频输入，但没有一�
 ```
 
 如果看到 `Upload URL did not returned from the create file request`，通常就是当前 `api_base`/代理不支持 Gemini Files API。
+
+## 自检与链路定位
+
+使用：
+
+```text
+/视频分析自检 https://example.com/video
+```
+
+该指令会自动检查：
+
+1. 是否能读取 AstrBot Gemini Provider 的 API Key / 模型；
+2. Gemini 文本生成是否可用；
+3. Gemini Files API 是否支持上传；
+4. yt-dlp 是否能解析 URL、视频时长、字幕/自动字幕列表；
+5. 可选 OpenAI 兼容 STT `/v1/audio/transcriptions` 是否可用。
+
+自检会脱敏显示 API Key。若中转站不支持 Gemini Files API，通常会在 “Gemini Files API” 步骤显示失败；如果配置了 `stt.enabled=true`，还会测试语音转文字中转接口。

@@ -127,5 +127,33 @@
         "default": "您请求的视频内容摘要已生成。以下内容由 AI 基于可见/可听信息自动整理，仅供参考，不代表事实核验或平台立场。"
       }
     }
+  },
+  "stt": {
+    "description": "OpenAI 兼容语音转文字自检（可选）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用 STT 自检",
+        "type": "bool",
+        "default": false
+      },
+      "api_base_url": {
+        "description": "OpenAI 兼容 API Base URL",
+        "type": "string",
+        "default": "",
+        "hint": "例如 https://api.example.com；自检会请求 /v1/audio/transcriptions。"
+      },
+      "api_key": {
+        "description": "OpenAI 兼容 API Key",
+        "type": "string",
+        "default": ""
+      },
+      "model": {
+        "description": "STT 模型名",
+        "type": "string",
+        "default": "whisper-1",
+        "hint": "也可尝试 gpt-4o-mini-transcribe、gpt-4o-transcribe，取决于中转站支持。"
+      }
+    }
   }
 }
