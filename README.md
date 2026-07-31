@@ -59,3 +59,7 @@
 - `access_control.public_domestic_only`：开启后普通用户只允许国内平台 URL；国外/高风险站点仅白名单/管理员/操作员可用。
 
 次数在视频成功构造为 OpenRouter 输入后扣除；URL 解析失败、下载失败、超过时长/大小不扣。安全拒绝扣除次数。
+
+## 下载格式回退
+
+对 B站等格式组合不稳定的平台，yt-dlp 会使用多轮格式 fallback：优先小体积/低分辨率 MP4，失败后逐步放宽到站点可用的 best/worst 格式，并继续受 `limits.max_file_size_mb` 约束。

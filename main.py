@@ -42,7 +42,7 @@ LEGACY_NON_VIDEO_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
     PLUGIN_NAME,
     "204343414",
     "OpenRouter Omni 视频内容分析与安全摘要",
-    "0.3.1",
+    "0.3.2",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -281,7 +281,14 @@ class VideoSummaryPlugin(Star):
             except OSError:
                 pass
 
-    def _ydl_opts(self, url: str, *, download: bool, outtmpl: str | None = None) -> dict:
+    def _ydl_opts(
+        self,
+        url: str,
+        *,
+        download: bool,
+        outtmpl: str | None = None,
+        format_selector: str | None = None,
+    ) -> dict:
         opts = {
             "quiet": True,
             "no_warnings": True,
@@ -292,13 +299,27 @@ class VideoSummaryPlugin(Star):
             opts.update(
                 {
                     "outtmpl": outtmpl,
-                    "format": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[ext=mp4]/best",
+                    "format": format_selector or self._download_format_selectors()[0],
                     "merge_output_format": "mp4",
+                    # Prefer small, compatible outputs when the site exposes a
+                    # choice, but do not fail solely because an exact 480p mp4
+                    # combination is unavailable.
+                    "format_sort": ["res:480", "vcodec:avc", "ext:mp4:m4a"],
                 }
             )
         else:
             opts["skip_download"] = True
         return opts
+
+    @staticmethod
+    def _download_format_selectors() -> list[str]:
+        return [
+            "bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+            "bestvideo[height<=720][vcodec^=avc1]+bestaudio/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "bestvideo+bestaudio/best",
+            "worstvideo+bestaudio/worst",
+            "best/worst",
+        ]
 
     async def _extract_info(self, url: str) -> dict:
         def task():
@@ -312,26 +333,63 @@ class VideoSummaryPlugin(Star):
 
     async def _download_video(self, url: str, task_id: str) -> tuple[Path, dict]:
         outtmpl = str(self.temp_dir / f"{task_id}_%(id)s.%(ext)s")
+        last_error: Exception | None = None
 
-        def task():
-            with yt_dlp.YoutubeDL(self._ydl_opts(url, download=True, outtmpl=outtmpl)) as ydl:
-                info = ydl.extract_info(url, download=True)
-                requested = info.get("requested_downloads") or []
-                candidates = [x.get("filepath") for x in requested if x.get("filepath")]
-                candidates += [info.get("filepath"), ydl.prepare_filename(info)]
-                return info, candidates
+        for index, selector in enumerate(self._download_format_selectors(), start=1):
+            # Remove partial outputs from previous failed selector attempts.
+            for old_path in self.temp_dir.glob(f"{task_id}_*"):
+                try:
+                    old_path.unlink()
+                except OSError:
+                    pass
 
-        info, candidates = await asyncio.to_thread(task)
-        files = [Path(x) for x in candidates if x and Path(x).exists()]
-        if not files:
-            files = sorted(self.temp_dir.glob(f"{task_id}_*"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not files:
-            raise RuntimeError("下载完成但找不到输出文件")
-        path = files[0]
-        size_mb = path.stat().st_size / 1024 / 1024
-        if size_mb > self.max_file_size_mb:
-            raise ValueError(f"视频文件 {size_mb:.1f}MB，超过上限 {self.max_file_size_mb:.1f}MB")
-        return path, info
+            def task():
+                with yt_dlp.YoutubeDL(
+                    self._ydl_opts(
+                        url,
+                        download=True,
+                        outtmpl=outtmpl,
+                        format_selector=selector,
+                    )
+                ) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    requested = info.get("requested_downloads") or []
+                    candidates = [x.get("filepath") for x in requested if x.get("filepath")]
+                    candidates += [info.get("filepath"), ydl.prepare_filename(info)]
+                    return info, candidates
+
+            try:
+                info, candidates = await asyncio.to_thread(task)
+                files = [Path(x) for x in candidates if x and Path(x).exists()]
+                if not files:
+                    files = sorted(
+                        self.temp_dir.glob(f"{task_id}_*"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                if not files:
+                    raise RuntimeError("下载完成但找不到输出文件")
+                path = files[0]
+                size_mb = path.stat().st_size / 1024 / 1024
+                if size_mb > self.max_file_size_mb:
+                    raise ValueError(
+                        f"视频文件 {size_mb:.1f}MB，超过上限 {self.max_file_size_mb:.1f}MB"
+                    )
+                if index > 1:
+                    logger.info("[VideoSummary] yt-dlp fallback selector #%d succeeded: %s", index, selector)
+                return path, info
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "[VideoSummary] yt-dlp selector #%d failed: %s error=%s",
+                    index,
+                    selector,
+                    exc,
+                )
+                continue
+
+        assert last_error is not None
+        raise last_error
 
     async def _resolve_openrouter_config(self, event: AstrMessageEvent) -> tuple[str, str, str, int, dict]:
         provider = None
