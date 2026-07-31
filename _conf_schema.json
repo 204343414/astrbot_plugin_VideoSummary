@@ -58,7 +58,7 @@
         "description": "尝试使用 yt-dlp 解析出的媒体直链",
         "type": "bool",
         "default": true,
-        "hint": "预留项：未来可在判定直链无需 Cookie/Referer 时直接传 URL，减少 base64 体积。当前主要路径仍是下载后 base64。"
+        "hint": "开启后先尝试 yt-dlp 解析出的最小音画合一 progressive 媒体直链；失败自动回退下载后 base64。直链可能因 Cookie/Referer/IP 绑定失效。"
       }
     }
   },

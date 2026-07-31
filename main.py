@@ -314,6 +314,23 @@ class VideoSummaryPlugin(Star):
             return self.youtube_cookies or self.generic_cookies
         return self.generic_cookies
 
+    @staticmethod
+    def _sanitize_cookie_text(value: str) -> str:
+        # QQ/Markdown renderers may turn cookie domains into links like
+        # [.bilibili.com](http://bilibili.com).  Netscape cookies require the
+        # raw domain in column 1, so restore common rendered forms.
+        value = html.unescape(str(value or ""))
+        if ("\\n" in value or "\\t" in value) and "\n" not in value:
+            value = value.replace("\\n", "\n").replace("\\t", "\t")
+        value = value.replace("\\[n", "\n").replace("[n", "\n")
+        value = re.sub(r"\[([^\]\s]+)\]\(https?://[^)]+\)", r"\1", value)
+        cleaned_lines = []
+        for line in value.splitlines():
+            line = line.strip("\ufeff")
+            line = line.lstrip("… ")
+            cleaned_lines.append(line)
+        return "\n".join(cleaned_lines)
+
     def _resolve_cookie_for_ytdlp(self, url: str) -> tuple[str | None, str | None]:
         value = self._cookie_config_for_url(url)
         if not value:
@@ -552,6 +569,39 @@ class VideoSummaryPlugin(Star):
                     return "\n".join(x for x in parts if x).strip()
                 return str(content).strip()
 
+    @staticmethod
+    def _format_size(format_info: dict) -> int:
+        for key in ("filesize", "filesize_approx"):
+            try:
+                value = int(format_info.get(key) or 0)
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+        return 10**18
+
+    def _select_progressive_media_url(self, info: dict) -> tuple[str, dict] | tuple[None, None]:
+        formats = info.get("formats") or []
+        candidates = []
+        for fmt in formats:
+            if not isinstance(fmt, dict):
+                continue
+            media_url = str(fmt.get("url") or "")
+            if not media_url.startswith(("http://", "https://")):
+                continue
+            if fmt.get("vcodec") in (None, "none") or fmt.get("acodec") in (None, "none"):
+                continue
+            # Prefer small progressive MP4/H.264, but allow other progressive
+            # URLs if that is all the site exposes.
+            ext_score = 0 if str(fmt.get("ext") or "").lower() == "mp4" else 1
+            codec_score = 0 if str(fmt.get("vcodec") or "").startswith(("avc1", "h264")) else 1
+            height = int(fmt.get("height") or 999999)
+            candidates.append((ext_score, codec_score, height, self._format_size(fmt), media_url, fmt))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: item[:4])
+        return candidates[0][4], candidates[0][5]
+
     def _video_data_url(self, video_path: Path) -> str:
         size_mb = video_path.stat().st_size / 1024 / 1024
         if size_mb > self.max_base64_video_mb:
@@ -570,7 +620,7 @@ class VideoSummaryPlugin(Star):
         user_id: str,
     ) -> tuple[str, int]:
         api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
-        if self.youtube_direct_url and self._is_youtube_url(url):
+        if video_path is None:
             video_ref = url
         elif video_path is not None and self.non_youtube_base64:
             video_ref = self._video_data_url(video_path)
@@ -748,7 +798,26 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                     return
 
                 downloaded_info = info
-                if self.youtube_direct_url and self._is_youtube_url(url):
+                direct_media_url, direct_fmt = (None, None)
+                if self.try_direct_media_url:
+                    direct_media_url, direct_fmt = self._select_progressive_media_url(info)
+                if direct_media_url:
+                    try:
+                        logger.info(
+                            "[VideoSummary] trying progressive direct media url format=%s height=%s size=%s",
+                            direct_fmt.get("format_id"),
+                            direct_fmt.get("height"),
+                            direct_fmt.get("filesize") or direct_fmt.get("filesize_approx"),
+                        )
+                        analysis, used = await self._analyze_with_openrouter(event, direct_media_url, None, question, user_id)
+                    except Exception as direct_exc:
+                        logger.warning(
+                            "[VideoSummary] OpenRouter progressive media URL failed, falling back to yt-dlp base64: %s",
+                            direct_exc,
+                        )
+                        video_path, downloaded_info = await self._download_video(url, task_id)
+                        analysis, used = await self._analyze_with_openrouter(event, url, video_path, question, user_id)
+                elif self.youtube_direct_url and self._is_youtube_url(url):
                     try:
                         analysis, used = await self._analyze_with_openrouter(event, url, None, question, user_id)
                     except Exception as direct_exc:

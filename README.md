@@ -84,3 +84,9 @@
 ```
 
 可以粘贴 Netscape cookies.txt 全文、浏览器 Cookie 请求头，或服务器上的 cookies.txt 文件路径。用于解决 B站/b23 412、抖音风控、YouTube 登录限制等。
+
+## 直链优先与 base64 兜底
+
+插件会先尝试从 yt-dlp 元信息里寻找最小的音画合一 progressive 媒体直链，并把该 URL 直接交给 OpenRouter。若上游模型无法访问该直链（常见原因：Cookie/Referer/IP 绑定、签名过期、防盗链），会自动回退到 yt-dlp 下载并 base64 传输。
+
+注意：OpenRouter video input 只有 URL 和 base64 data URL 两种形式；没有独立的“文件上传后传 file_id”接口。

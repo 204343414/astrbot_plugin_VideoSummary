@@ -107,6 +107,22 @@ class VideoSummaryCoreTests(unittest.TestCase):
         self.assertIsNone(header)
         self.assertIn("SESSDATA", Path(cookiefile).read_text())
 
+    def test_sanitize_markdown_polluted_cookie_domain(self):
+        dirty = "….[bilibili.com](http://bilibili.com)\tTRUE\t/\tFALSE\t0\tb_lsid\tabc"
+        clean = self.mod.VideoSummaryPlugin._sanitize_cookie_text(dirty)
+        self.assertEqual(clean, ".bilibili.com\tTRUE\t/\tFALSE\t0\tb_lsid\tabc")
+
+    def test_select_progressive_media_url_prefers_small_mp4_with_audio(self):
+        plugin = self.mod.VideoSummaryPlugin.__new__(self.mod.VideoSummaryPlugin)
+        info = {"formats": [
+            {"url": "https://cdn/high.mp4", "vcodec": "avc1", "acodec": "mp4a", "ext": "mp4", "height": 720, "filesize": 1000},
+            {"url": "https://cdn/low.mp4", "vcodec": "avc1", "acodec": "mp4a", "ext": "mp4", "height": 144, "filesize": 500},
+            {"url": "https://cdn/videoonly.mp4", "vcodec": "avc1", "acodec": "none", "ext": "mp4", "height": 144, "filesize": 100},
+        ]}
+        url, fmt = plugin._select_progressive_media_url(info)
+        self.assertEqual(url, "https://cdn/low.mp4")
+        self.assertEqual(fmt["height"], 144)
+
 
 if __name__ == "__main__":
     unittest.main()
