@@ -29,8 +29,8 @@
 
 ## URL 策略
 
-- YouTube：默认直接把 URL 作为 `video_url` 传给 OpenRouter。
-- B站/抖音等非 YouTube：yt-dlp 下载低清 MP4，在 `openrouter.max_base64_video_mb` 限制内转成 `data:video/mp4;base64,...` 传给 OpenRouter。
+- 默认所有平台都先由 yt-dlp 下载低清 MP4，再在 `openrouter.max_base64_video_mb` 限制内转成 `data:video/mp4;base64,...` 传给 OpenRouter。
+- 如果开启 `openrouter.youtube_direct_url`，YouTube 会先尝试直接 URL；若上游无法打开视频流，会自动回退到下载后 base64。
 
 ## 安全输出
 
@@ -45,9 +45,10 @@
 自检会检查：
 
 1. OpenRouter 文本是否可用；
-2. OpenRouter `video_url` 是否可用；
-3. yt-dlp 是否能解析 URL、视频时长、字幕/自动字幕列表；
-4. 时长限制是否会拦截。
+2. OpenRouter 直接 `video_url` 是否可用；
+3. OpenRouter 下载后 base64 视频是否可用；
+4. yt-dlp 是否能解析 URL、视频时长、字幕/自动字幕列表；
+5. 时长限制是否会拦截。
 
 ## 额度与限制
 

@@ -40,12 +40,14 @@
       "youtube_direct_url": {
         "description": "YouTube 直接传 URL",
         "type": "bool",
-        "default": true
+        "default": false,
+        "hint": "关闭时 YouTube 也先由 yt-dlp 下载，再用 base64 视频传给 OpenRouter；NVIDIA Omni 当前经常无法自行拉取 YouTube/Shorts，推荐保持关闭。开启后会先尝试直接 URL，失败会回退到下载+base64。"
       },
       "non_youtube_use_base64": {
         "description": "非 YouTube 下载后用 base64 视频传 OpenRouter",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "非 YouTube URL 通常不能由上游直接访问，推荐保持开启：先下载低清 MP4，再在 max_base64_video_mb 限制内传给 OpenRouter。"
       },
       "max_base64_video_mb": {
         "description": "OpenRouter base64 视频最大 MB",

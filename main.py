@@ -42,7 +42,7 @@ LEGACY_NON_VIDEO_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
     PLUGIN_NAME,
     "204343414",
     "OpenRouter Omni 视频内容分析与安全摘要",
-    "0.3.0",
+    "0.3.1",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -103,7 +103,7 @@ class VideoSummaryPlugin(Star):
             or "https://github.com/204343414/astrbot_plugin_VideoSummary"
         ).strip()
         self.openrouter_title = str(openrouter.get("title", "AstrBot VideoSummary") or "AstrBot VideoSummary").strip()
-        self.youtube_direct_url = bool(openrouter.get("youtube_direct_url", True))
+        self.youtube_direct_url = bool(openrouter.get("youtube_direct_url", False))
         self.non_youtube_base64 = bool(openrouter.get("non_youtube_use_base64", True))
         self.max_base64_video_mb = max(float(openrouter.get("max_base64_video_mb", 15)), 1.0)
 
@@ -605,7 +605,15 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
 
                 downloaded_info = info
                 if self.youtube_direct_url and self._is_youtube_url(url):
-                    analysis, used = await self._analyze_with_openrouter(event, url, None, question, user_id)
+                    try:
+                        analysis, used = await self._analyze_with_openrouter(event, url, None, question, user_id)
+                    except Exception as direct_exc:
+                        logger.warning(
+                            "[VideoSummary] OpenRouter direct video_url failed, falling back to yt-dlp base64: %s",
+                            direct_exc,
+                        )
+                        video_path, downloaded_info = await self._download_video(url, task_id)
+                        analysis, used = await self._analyze_with_openrouter(event, url, video_path, question, user_id)
                 else:
                     video_path, downloaded_info = await self._download_video(url, task_id)
                     analysis, used = await self._analyze_with_openrouter(event, url, video_path, question, user_id)
@@ -624,6 +632,38 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                     except OSError:
                         pass
 
+    async def _probe_openrouter_base64_video(self, event: AstrMessageEvent, url: str) -> str:
+        if not url:
+            return "SKIP：未提供 URL"
+        task_id = f"diag_{int(time.time() * 1000)}"
+        video_path: Path | None = None
+        try:
+            video_path, _info = await self._download_video(url, task_id)
+            size_mb = video_path.stat().st_size / 1024 / 1024
+            if size_mb > self.max_base64_video_mb:
+                return f"SKIP：下载后 {size_mb:.1f}MB，超过 max_base64_video_mb={self.max_base64_video_mb:.1f}MB"
+            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
+            video_ref = self._video_data_url(video_path)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请用中文用一句话描述这个视频。"},
+                        {"type": "video_url", "video_url": {"url": video_ref}},
+                    ],
+                }
+            ]
+            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
+            return f"OK：file={size_mb:.1f}MB resp={text[:160] or '<empty>'}"
+        except Exception as exc:
+            return "FAIL：" + self._short_error(exc)
+        finally:
+            for path in self.temp_dir.glob(f"{task_id}_*"):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
     @filter.command("视频分析自检")
     async def diagnostics(self, event: AstrMessageEvent, text: GreedyStr = ""):
         """自检 OpenRouter Omni、yt-dlp 和配置。"""
@@ -638,7 +678,8 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                 pass
         lines.append(f"URL：{url or '未提供'}")
         lines.append("OpenRouter 文本：" + await self._probe_openrouter_text(event))
-        lines.append("OpenRouter 视频URL：" + await self._probe_openrouter_video_url(event, url))
+        lines.append("OpenRouter 直接视频URL：" + await self._probe_openrouter_video_url(event, url))
+        lines.append("OpenRouter 下载后base64视频：" + await self._probe_openrouter_base64_video(event, url))
         if url:
             try:
                 info = await self._extract_info(url)
