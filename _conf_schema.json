@@ -1,20 +1,4 @@
 {
-  "backend": {
-    "description": "分析后端",
-    "type": "object",
-    "items": {
-      "mode": {
-        "description": "后端模式",
-        "type": "string",
-        "options": [
-          "qwen_video",
-          "openrouter_video"
-        ],
-        "default": "qwen_video",
-        "hint": "qwen_video=阿里百炼/Qwen OpenAI兼容视频理解；openrouter_video=OpenRouter video_url。"
-      }
-    }
-  },
   "qwen": {
     "description": "阿里百炼 / Qwen 视频理解",
     "type": "object",
@@ -59,72 +43,10 @@
         "description": "Base64 视频前缀",
         "type": "string",
         "default": "data:;base64,",
-        "hint": "qwen3.5-omni 文档示例使用 data:;base64,；部分 VL 模型也支持 data:video/mp4;base64,"
-      },
-      "max_base64_video_mb": {
-        "description": "Qwen base64 视频最大 MB",
-        "type": "float",
-        "default": 15
-      }
-    }
-  },
-  "openrouter": {
-    "description": "OpenRouter Omni 视频理解",
-    "type": "object",
-    "items": {
-      "provider_id": {
-        "description": "AstrBot OpenAI兼容 Provider ID",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider",
-        "hint": "推荐选择 openai_2 这类已配置 OpenRouter 的 Provider。Provider ID 是完整字符串，不是数字。也兼容手填 openai_2/nvidia/xxx:free。"
-      },
-      "api_key": {
-        "description": "OpenRouter API Key（可选）",
-        "type": "string",
-        "default": "",
-        "hint": "如果已选择 provider_id，可留空复用 Provider 的 key。"
-      },
-      "base_url": {
-        "description": "OpenRouter Base URL",
-        "type": "string",
-        "default": "https://openrouter.ai/api/v1"
-      },
-      "model": {
-        "description": "OpenRouter Omni 视频模型",
-        "type": "string",
-        "default": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-        "hint": "本插件专精 OpenRouter video_url。nvidia/nemotron-3-nano-30b-a3b:free 文本可用但不支持 video input，请使用带 omni 的视频模型。"
-      },
-      "referer": {
-        "description": "HTTP-Referer",
-        "type": "string",
-        "default": "https://github.com/204343414/astrbot_plugin_VideoSummary"
-      },
-      "title": {
-        "description": "X-Title",
-        "type": "string",
-        "default": "AstrBot VideoSummary"
-      },
-      "youtube_direct_url": {
-        "description": "YouTube 直接传 URL",
-        "type": "bool",
-        "default": false,
-        "hint": "关闭时 YouTube 也先由 yt-dlp 下载，再用 base64 视频传给 OpenRouter；NVIDIA Omni 当前经常无法自行拉取 YouTube/Shorts，推荐保持关闭。开启后会先尝试直接 URL，失败会回退到下载+base64。"
-      },
-      "non_youtube_use_base64": {
-        "description": "非 YouTube 下载后用 base64 视频传 OpenRouter",
-        "type": "bool",
-        "default": true,
-        "hint": "非 YouTube URL 通常不能由上游直接访问，推荐保持开启：先下载低清 MP4，再在 max_base64_video_mb 限制内传给 OpenRouter。"
-      },
-      "max_base64_video_mb": {
-        "description": "OpenRouter base64 视频最大 MB",
-        "type": "float",
-        "default": 15
+        "hint": "qwen3.5-omni 文档示例使用 data:;base64,；部分 VL 模型也支持 data:video/mp4;base64,。"
       },
       "try_direct_media_url": {
-        "description": "尝试使用 yt-dlp 解析出的媒体直链",
+        "description": "优先尝试最小音画合一直链",
         "type": "bool",
         "default": true,
         "hint": "开启后先尝试 yt-dlp 解析出的最小音画合一 progressive 媒体直链；失败自动回退下载后 base64。直链可能因 Cookie/Referer/IP 绑定失效。"
@@ -138,12 +60,8 @@
       "max_duration_minutes": {
         "description": "最大视频时长（分钟）",
         "type": "float",
-        "default": 10
-      },
-      "max_file_size_mb": {
-        "description": "最大下载文件大小 MB",
-        "type": "float",
-        "default": 120
+        "default": 10,
+        "hint": "只按视频时长限制，不按文件大小限制。"
       },
       "daily_limit_per_user": {
         "description": "每人每日次数，0 表示不限制",
@@ -183,6 +101,41 @@
       }
     }
   },
+  "cookies": {
+    "description": "yt-dlp Cookies（可选）",
+    "type": "object",
+    "hint": "支持粘贴 Netscape cookies.txt 全文、浏览器 Cookie 请求头，或填写服务器 cookies.txt 路径。用于 B站 412、抖音风控、YouTube 登录限制等。",
+    "items": {
+      "bilibili": {
+        "description": "Bilibili/b23 cookies.txt / Cookie 请求头 / 文件路径",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "text",
+        "default": ""
+      },
+      "douyin": {
+        "description": "Douyin cookies.txt / Cookie 请求头 / 文件路径",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "text",
+        "default": ""
+      },
+      "youtube": {
+        "description": "YouTube cookies.txt / Cookie 请求头 / 文件路径",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "text",
+        "default": ""
+      },
+      "generic": {
+        "description": "通用 cookies.txt / Cookie 请求头 / 文件路径",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "text",
+        "default": ""
+      }
+    }
+  },
   "prompts": {
     "description": "提示词",
     "type": "object",
@@ -216,41 +169,6 @@
         "description": "免责声明",
         "type": "text",
         "default": "您请求的视频内容摘要已生成。以下内容由 AI 基于可见/可听信息自动整理，仅供参考，不代表事实核验或平台立场。"
-      }
-    }
-  },
-  "cookies": {
-    "description": "yt-dlp Cookies（可选）",
-    "type": "object",
-    "hint": "支持粘贴 Netscape cookies.txt 全文、浏览器 Cookie 请求头，或填写服务器 cookies.txt 路径。用于 B站 412、抖音风控、YouTube 登录限制等。",
-    "items": {
-      "bilibili": {
-        "description": "Bilibili/b23 cookies.txt / Cookie 请求头 / 文件路径",
-        "type": "text",
-        "editor_mode": true,
-        "editor_language": "text",
-        "default": ""
-      },
-      "douyin": {
-        "description": "Douyin cookies.txt / Cookie 请求头 / 文件路径",
-        "type": "text",
-        "editor_mode": true,
-        "editor_language": "text",
-        "default": ""
-      },
-      "youtube": {
-        "description": "YouTube cookies.txt / Cookie 请求头 / 文件路径",
-        "type": "text",
-        "editor_mode": true,
-        "editor_language": "text",
-        "default": ""
-      },
-      "generic": {
-        "description": "通用 cookies.txt / Cookie 请求头 / 文件路径",
-        "type": "text",
-        "editor_mode": true,
-        "editor_language": "text",
-        "default": ""
       }
     }
   }

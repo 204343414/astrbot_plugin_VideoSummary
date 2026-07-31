@@ -1,6 +1,6 @@
-# Qwen / OpenRouter 视频分析插件
+# Qwen 视频分析插件
 
-默认专精阿里百炼/Qwen OpenAI 兼容视频理解，也可切换 OpenRouter Omni。插件会使用 yt-dlp 获取视频，并以图片卡片输出摘要。
+专精阿里百炼/Qwen OpenAI 兼容视频理解。插件使用 yt-dlp 获取视频，并以图片卡片输出摘要。
 
 ## 指令
 
@@ -15,7 +15,6 @@
 
 ```json
 {
-  "backend": {"mode": "qwen_video"},
   "qwen": {
     "provider_id": "阿里",
     "model": "qwen3.5-omni-flash-2026-03-15",
@@ -27,7 +26,7 @@
 }
 ```
 
-`provider_id` 是 AstrBot 里的完整 Provider ID，不是序号。也可以直接填写 `qwen.api_key`。
+`provider_id` 是 AstrBot 里的完整 Provider ID。也可以直接填写 `qwen.api_key`。
 
 ## 输入策略
 
@@ -36,19 +35,13 @@
 - 若直链因 Cookie/Referer/IP 绑定等原因不可访问，则下载最小可用视频并转 base64。
 - B站/抖音等平台可在 `cookies` 配置里填写 cookies.txt / Cookie Header / 文件路径。
 
-## OpenRouter 可选后端
+## 只按时长限制
 
-若要继续试 OpenRouter：
+插件不再按文件大小限制视频。唯一资源限制是：
 
-```json
-{
-  "backend": {"mode": "openrouter_video"},
-  "openrouter": {
-    "provider_id": "openai_2",
-    "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-  }
-}
-```
+- `limits.max_duration_minutes`：最大视频分钟数；
+- `limits.daily_limit_per_user`：每人每日次数；
+- `limits.max_concurrent_jobs`：最大并发任务数。
 
 ## 自检
 
@@ -56,7 +49,7 @@
 /视频分析自检 https://example.com/video
 ```
 
-会检查当前后端文本、直接视频 URL、下载后 base64 视频、yt-dlp 元信息、字幕列表、限制条件。
+会检查当前 Qwen 文本、Qwen 直接视频 URL、Qwen 下载后 base64 视频、yt-dlp 元信息、最小音画合一直链、字幕列表和时长限制。
 
 ## 安全输出
 
