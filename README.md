@@ -69,3 +69,32 @@ AstrBot v4.26.x 的 ProviderRequest 支持图片与音频输入，但没有一�
 5. 可选 OpenAI 兼容 STT `/v1/audio/transcriptions` 是否可用。
 
 自检会脱敏显示 API Key。若中转站不支持 Gemini Files API，通常会在 “Gemini Files API” 步骤显示失败；如果配置了 `stt.enabled=true`，还会测试语音转文字中转接口。
+
+## OpenRouter 视频后端
+
+如果 Google Gemini Files API 或中转站不支持 `/upload/v1beta/files`，可以改用 OpenRouter 的 `video_url` 输入。
+
+推荐配置示例：
+
+```json
+{
+  "backend": {"mode": "openrouter_video"},
+  "openrouter": {
+    "provider_id": "openai_2",
+    "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+    "base_url": "https://openrouter.ai/api/v1"
+  }
+}
+```
+
+也可直接填写 `openrouter.api_key`。`provider_id` 适合复用 AstrBot 已配置的 OpenAI 兼容 Provider。
+
+注意：`nvidia/nemotron-3-nano-30b-a3b:free` 不一定支持视频输入。请先用：
+
+```text
+/视频分析自检 https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+查看 “OpenRouter 视频URL” 是否 OK。若失败，可尝试 OpenRouter 上明确支持 video input 的模型，例如 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`。
+
+对于 B站/抖音等非 YouTube URL，插件会先下载低清 MP4，再在 `openrouter.max_base64_video_mb` 限制内转成 base64 data URL 发送。

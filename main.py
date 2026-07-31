@@ -7,6 +7,7 @@ but no first-class video part in ProviderRequest.
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import wave
 import json
@@ -42,7 +43,7 @@ PLUGIN_NAME = "astrbot_plugin_VideoSummary"
     PLUGIN_NAME,
     "204343414",
     "Gemini 视频内容分析与安全摘要",
-    "0.1.2",
+    "0.2.0",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -103,6 +104,36 @@ class VideoSummaryPlugin(Star):
         self.stt_api_base_url = str(stt.get("api_base_url", "") or "").strip().rstrip("/")
         self.stt_api_key = str(stt.get("api_key", "") or "").strip()
         self.stt_model = str(stt.get("model", "whisper-1") or "whisper-1").strip()
+
+        backend = config.get("backend", {}) or {}
+        self.backend_mode = str(backend.get("mode", "auto") or "auto").strip().lower()
+        openrouter = config.get("openrouter", {}) or {}
+        self.openrouter_provider_id = str(openrouter.get("provider_id", "") or "").strip()
+        self.openrouter_api_key = str(openrouter.get("api_key", "") or "").strip()
+        self.openrouter_base_url = str(
+            openrouter.get("base_url", "https://openrouter.ai/api/v1")
+            or "https://openrouter.ai/api/v1"
+        ).strip().rstrip("/")
+        self.openrouter_model = str(
+            openrouter.get("model", "nvidia/nemotron-3-nano-30b-a3b:free")
+            or "nvidia/nemotron-3-nano-30b-a3b:free"
+        ).strip()
+        # Convenience: allow writing provider/model as one value, e.g.
+        # "openai_2/nvidia/nemotron-3-nano-30b-a3b:free".
+        if "/" in self.openrouter_provider_id and not self.openrouter_api_key:
+            provider_part, model_part = self.openrouter_provider_id.split("/", 1)
+            if provider_part:
+                self.openrouter_provider_id = provider_part
+                if model_part:
+                    self.openrouter_model = model_part
+        self.openrouter_referer = str(
+            openrouter.get("referer", "https://github.com/204343414/astrbot_plugin_VideoSummary")
+            or "https://github.com/204343414/astrbot_plugin_VideoSummary"
+        ).strip()
+        self.openrouter_title = str(openrouter.get("title", "AstrBot VideoSummary") or "AstrBot VideoSummary").strip()
+        self.openrouter_youtube_direct_url = bool(openrouter.get("youtube_direct_url", True))
+        self.openrouter_non_youtube_base64 = bool(openrouter.get("non_youtube_use_base64", True))
+        self.openrouter_max_base64_video_mb = max(float(openrouter.get("max_base64_video_mb", 15)), 1.0)
 
         self._cleanup_stale_temp()
         logger.info(
@@ -336,6 +367,146 @@ class VideoSummaryPlugin(Star):
         timeout = int(getattr(provider, "timeout", 180) or 180)
         return api_key, model, api_base, timeout
 
+    def _has_openrouter_config(self) -> bool:
+        return bool(self.openrouter_api_key or self.openrouter_provider_id)
+
+    def _select_backend(self) -> str:
+        mode = self.backend_mode
+        if mode in {"openrouter", "openrouter_video"}:
+            return "openrouter_video"
+        if mode in {"gemini", "gemini_files"}:
+            return "gemini_files"
+        # auto: prefer OpenRouter only when explicitly configured.
+        return "openrouter_video" if self._has_openrouter_config() else "gemini_files"
+
+    @staticmethod
+    def _is_youtube_url(url: str) -> bool:
+        try:
+            from urllib.parse import urlsplit
+
+            host = urlsplit(url).netloc.lower()
+        except Exception:
+            return False
+        return "youtube.com" in host or "youtu.be" in host
+
+    async def _resolve_openrouter_config(self, event: AstrMessageEvent) -> tuple[str, str, str, int, dict]:
+        provider = None
+        if self.openrouter_provider_id:
+            provider = await self.context.provider_manager.get_provider_by_id(self.openrouter_provider_id)
+            if provider is None:
+                raise RuntimeError(f"未找到 OpenRouter/OpenAI Provider: {self.openrouter_provider_id}")
+
+        api_key = self.openrouter_api_key
+        base_url = self.openrouter_base_url
+        model = self.openrouter_model
+        timeout = 120
+        custom_headers = {}
+
+        if provider is not None:
+            if not api_key:
+                if hasattr(provider, "get_current_key"):
+                    api_key = str(provider.get_current_key() or "")
+                if not api_key:
+                    api_key = str(getattr(provider, "chosen_api_key", "") or "")
+                if not api_key:
+                    keys = getattr(provider, "api_keys", []) or []
+                    api_key = str(keys[0]) if keys else ""
+            provider_config = getattr(provider, "provider_config", {}) or {}
+            if not model:
+                model = str(getattr(provider, "get_model", lambda: "")() or provider_config.get("model", "") or "")
+            if not base_url or base_url == "https://openrouter.ai/api/v1":
+                # If the provider is already an OpenRouter/OpenAI-compatible
+                # AstrBot provider, reuse its base_url.
+                client = getattr(provider, "client", None)
+                client_base = str(getattr(client, "base_url", "") or "").rstrip("/")
+                base_url = client_base or str(provider_config.get("api_base", "") or base_url).rstrip("/")
+            timeout = int(getattr(provider, "timeout", provider_config.get("timeout", 120)) or 120)
+            custom_headers = dict(getattr(provider, "custom_headers", None) or provider_config.get("custom_headers", {}) or {})
+
+        if not api_key:
+            raise RuntimeError("OpenRouter API key 未配置；请填写 openrouter.api_key 或 openrouter.provider_id。")
+        if not model:
+            raise RuntimeError("OpenRouter model 未配置。")
+        base_url = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        return api_key, base_url, model, timeout, custom_headers
+
+    async def _openrouter_chat(self, api_key: str, base_url: str, model: str, timeout_seconds: int, messages: list, custom_headers: dict | None = None) -> str:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": self.openrouter_referer,
+            "X-Title": self.openrouter_title,
+        }
+        if custom_headers:
+            headers.update({str(k): str(v) for k, v in custom_headers.items()})
+        payload = {"model": model, "messages": messages}
+        timeout = aiohttp.ClientTimeout(total=max(timeout_seconds, 30), connect=15)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(f"{base_url}/chat/completions", headers=headers, json=payload) as resp:
+                raw = await resp.text()
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {"raw": raw}
+                if resp.status >= 400:
+                    err = data.get("error") if isinstance(data, dict) else None
+                    msg = err.get("message") if isinstance(err, dict) else raw
+                    raise RuntimeError(f"OpenRouter HTTP {resp.status}: {str(msg)[:300]}")
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if not choices:
+                    raise RuntimeError(f"OpenRouter 未返回 choices: {str(data)[:300]}")
+                content = choices[0].get("message", {}).get("content", "")
+                if isinstance(content, str):
+                    return content.strip()
+                if isinstance(content, list):
+                    parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            parts.append(str(item.get("text") or item.get("content") or ""))
+                    return "\n".join(x for x in parts if x).strip()
+                return str(content).strip()
+
+    def _video_data_url(self, video_path: Path) -> str:
+        size_mb = video_path.stat().st_size / 1024 / 1024
+        if size_mb > self.openrouter_max_base64_video_mb:
+            raise ValueError(
+                f"OpenRouter base64 视频上限 {self.openrouter_max_base64_video_mb:.1f}MB，当前 {size_mb:.1f}MB"
+            )
+        encoded = base64.b64encode(video_path.read_bytes()).decode("ascii")
+        return f"data:video/mp4;base64,{encoded}"
+
+    async def _analyze_with_openrouter(
+        self,
+        event: AstrMessageEvent,
+        url: str,
+        video_path: Path | None,
+        user_question: str,
+        user_id: str,
+    ) -> tuple[str, int]:
+        api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
+        if self.openrouter_youtube_direct_url and self._is_youtube_url(url):
+            video_ref = url
+        elif video_path is not None and self.openrouter_non_youtube_base64:
+            video_ref = self._video_data_url(video_path)
+        else:
+            raise RuntimeError("当前 OpenRouter 配置无法为该 URL 构造视频输入。")
+        # Charge after we have a valid video reference for OpenRouter.
+        used = self._charge_usage(user_id)
+        prompt = self._build_prompt(user_question)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "video_url", "video_url": {"url": video_ref}},
+                ],
+            }
+        ]
+        text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
+        if not text:
+            raise RuntimeError("OpenRouter 未返回文本结果")
+        return text, used
+
     async def _upload_and_wait_file(self, client, video_path: Path):
         try:
             uploaded = await asyncio.to_thread(client.files.upload, file=str(video_path))
@@ -489,10 +660,22 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                     yield event.plain_result(f"视频时长 {duration/60:.1f} 分钟，超过上限 {self.max_duration_minutes:.1f} 分钟。")
                     return
 
-                video_path, downloaded_info = await self._download_video(url, task_id)
-                analysis, used = await self._analyze_with_gemini(
-                    event, video_path, question, user_id
-                )
+                backend = self._select_backend()
+                downloaded_info = info
+                if backend == "openrouter_video" and self.openrouter_youtube_direct_url and self._is_youtube_url(url):
+                    analysis, used = await self._analyze_with_openrouter(
+                        event, url, None, question, user_id
+                    )
+                else:
+                    video_path, downloaded_info = await self._download_video(url, task_id)
+                    if backend == "openrouter_video":
+                        analysis, used = await self._analyze_with_openrouter(
+                            event, url, video_path, question, user_id
+                        )
+                    else:
+                        analysis, used = await self._analyze_with_gemini(
+                            event, video_path, question, user_id
+                        )
                 title = str(downloaded_info.get("title") or info.get("title") or self.card_title)
                 image = await self._render_card(title, analysis, url, safe=not self._looks_refusal(analysis))
                 yield event.image_result(image)
@@ -593,6 +776,36 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
             except OSError:
                 pass
 
+    async def _probe_openrouter_text(self, event: AstrMessageEvent) -> str:
+        try:
+            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
+            messages = [{"role": "user", "content": "请只回复 PONG"}]
+            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
+            return f"OK：model={model} key={self._mask_secret(api_key)} base={base_url} resp={text[:80] or '<empty>'}"
+        except Exception as exc:
+            return "FAIL：" + self._short_error(exc)
+
+    async def _probe_openrouter_video_url(self, event: AstrMessageEvent, url: str) -> str:
+        if not url:
+            return "SKIP：未提供 URL"
+        if not self._is_youtube_url(url):
+            return "SKIP：非 YouTube URL；OpenRouter 直接 URL 支持取决于模型/Provider，非 YouTube 通常需下载后 base64。"
+        try:
+            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请用中文用一句话描述这个视频。"},
+                        {"type": "video_url", "video_url": {"url": url}},
+                    ],
+                }
+            ]
+            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
+            return f"OK：{text[:160] or '<empty>'}"
+        except Exception as exc:
+            return "FAIL：" + self._short_error(exc)
+
     @filter.command("视频分析自检")
     async def diagnostics(self, event: AstrMessageEvent, text: GreedyStr = ""):
         """自检 Gemini Files API、字幕信息、STT 中转站等链路。"""
@@ -616,6 +829,12 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
             lines.append("Gemini Files API：" + await self._probe_gemini_file_api(client))
         except Exception as exc:
             lines.append("Gemini Provider：FAIL " + self._short_error(exc))
+
+        if self._has_openrouter_config():
+            lines.append("OpenRouter 文本：" + await self._probe_openrouter_text(event))
+            lines.append("OpenRouter 视频URL：" + await self._probe_openrouter_video_url(event, url))
+        else:
+            lines.append("OpenRouter：SKIP：未配置 openrouter.api_key 或 openrouter.provider_id")
 
         if url:
             try:
