@@ -43,7 +43,7 @@ PLUGIN_NAME = "astrbot_plugin_VideoSummary"
     PLUGIN_NAME,
     "204343414",
     "Gemini 视频内容分析与安全摘要",
-    "0.2.0",
+    "0.2.1",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -106,7 +106,7 @@ class VideoSummaryPlugin(Star):
         self.stt_model = str(stt.get("model", "whisper-1") or "whisper-1").strip()
 
         backend = config.get("backend", {}) or {}
-        self.backend_mode = str(backend.get("mode", "auto") or "auto").strip().lower()
+        self.backend_mode = str(backend.get("mode", "openrouter_video") or "openrouter_video").strip().lower()
         openrouter = config.get("openrouter", {}) or {}
         self.openrouter_provider_id = str(openrouter.get("provider_id", "") or "").strip()
         self.openrouter_api_key = str(openrouter.get("api_key", "") or "").strip()
@@ -115,8 +115,8 @@ class VideoSummaryPlugin(Star):
             or "https://openrouter.ai/api/v1"
         ).strip().rstrip("/")
         self.openrouter_model = str(
-            openrouter.get("model", "nvidia/nemotron-3-nano-30b-a3b:free")
-            or "nvidia/nemotron-3-nano-30b-a3b:free"
+            openrouter.get("model", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
+            or "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
         ).strip()
         # Convenience: allow writing provider/model as one value, e.g.
         # "openai_2/nvidia/nemotron-3-nano-30b-a3b:free".
@@ -820,15 +820,18 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                 pass
         lines.append(f"URL：{url or '未提供'}")
 
-        try:
-            api_key, model, api_base, timeout = await self._resolve_gemini_provider(event)
-            lines.append(f"Gemini Provider：OK model={model} key={self._mask_secret(api_key)}")
-            lines.append(f"Gemini api_base：{api_base or 'Google 官方默认'} timeout={timeout}s")
-            client = genai.Client(api_key=api_key, http_options=types.HttpOptions(base_url=api_base, timeout=timeout * 1000))
-            lines.append("Gemini 文本生成：" + await self._probe_gemini_text(client, model))
-            lines.append("Gemini Files API：" + await self._probe_gemini_file_api(client))
-        except Exception as exc:
-            lines.append("Gemini Provider：FAIL " + self._short_error(exc))
+        if self.backend_mode in {"gemini", "gemini_files"} or self.provider_id:
+            try:
+                api_key, model, api_base, timeout = await self._resolve_gemini_provider(event)
+                lines.append(f"Gemini Provider：OK model={model} key={self._mask_secret(api_key)}")
+                lines.append(f"Gemini api_base：{api_base or 'Google 官方默认'} timeout={timeout}s")
+                client = genai.Client(api_key=api_key, http_options=types.HttpOptions(base_url=api_base, timeout=timeout * 1000))
+                lines.append("Gemini 文本生成：" + await self._probe_gemini_text(client, model))
+                lines.append("Gemini Files API：" + await self._probe_gemini_file_api(client))
+            except Exception as exc:
+                lines.append("Gemini Provider：FAIL " + self._short_error(exc))
+        else:
+            lines.append("Gemini：SKIP：当前后端为 OpenRouter，未配置 gemini.provider_id")
 
         if self._has_openrouter_config():
             lines.append("OpenRouter 文本：" + await self._probe_openrouter_text(event))

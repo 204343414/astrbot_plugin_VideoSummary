@@ -11,8 +11,8 @@
           "gemini_files",
           "openrouter_video"
         ],
-        "default": "auto",
-        "hint": "auto=配置了 OpenRouter 就优先 OpenRouter，否则 Gemini Files API；gemini_files=Google Gemini Files API；openrouter_video=OpenRouter video_url。"
+        "default": "openrouter_video",
+        "hint": "默认专精 OpenRouter video_url；gemini_files=Google Gemini Files API；auto=配置了 OpenRouter 就优先 OpenRouter，否则 Gemini Files API。"
       }
     }
   },
@@ -24,7 +24,8 @@
         "description": "AstrBot OpenAI兼容 Provider ID（可选）",
         "type": "string",
         "default": "",
-        "hint": "例如 openai_2。填写后复用该 Provider 的 API key/base_url/model；下方 model 非空时会覆盖 Provider 模型。"
+        "hint": "选择 AstrBot 里配置的 OpenAI 兼容 Provider，例如 openai_2。注意它是字符串 ID，不是数字 2。也兼容手填 openai_2/nvidia/xxx:free，但推荐 provider_id 和 model 分开填。",
+        "_special": "select_provider"
       },
       "api_key": {
         "description": "OpenRouter API Key（可选）",
@@ -39,8 +40,8 @@
       "model": {
         "description": "OpenRouter 模型名",
         "type": "string",
-        "default": "nvidia/nemotron-3-nano-30b-a3b:free",
-        "hint": "你当前测试的免费模型。注意：若该模型不支持 video input，自检会显示 OpenRouter 视频URL失败；可尝试 nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free 等支持 video 的模型。"
+        "default": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "hint": "默认使用 OpenRouter 上明确支持 video/audio/image/text 的 NVIDIA Omni free 模型。nvidia/nemotron-3-nano-30b-a3b:free 文本可用但自检显示不支持 video input。"
       },
       "referer": {
         "description": "HTTP-Referer",

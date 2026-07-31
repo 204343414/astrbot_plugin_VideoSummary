@@ -81,7 +81,7 @@ AstrBot v4.26.x 的 ProviderRequest 支持图片与音频输入，但没有一�
   "backend": {"mode": "openrouter_video"},
   "openrouter": {
     "provider_id": "openai_2",
-    "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+    "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "base_url": "https://openrouter.ai/api/v1"
   }
 }
@@ -98,3 +98,18 @@ AstrBot v4.26.x 的 ProviderRequest 支持图片与音频输入，但没有一�
 查看 “OpenRouter 视频URL” 是否 OK。若失败，可尝试 OpenRouter 上明确支持 video input 的模型，例如 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`。
 
 对于 B站/抖音等非 YouTube URL，插件会先下载低清 MP4，再在 `openrouter.max_base64_video_mb` 限制内转成 base64 data URL 发送。
+
+### OpenRouter Provider ID 是字符串
+
+AstrBot 的 Provider ID 不是数字，而是字符串，例如 `openai_2`。WebUI 里看到的 `2` 只是名字的一部分，配置时应填完整 ID：
+
+```json
+{
+  "openrouter": {
+    "provider_id": "openai_2",
+    "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+  }
+}
+```
+
+`nvidia/nemotron-3-nano-30b-a3b:free` 文本可用，但你自检里已经显示它没有 video endpoint。视频理解请优先试带 `omni` 的模型。
