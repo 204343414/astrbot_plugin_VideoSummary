@@ -63,3 +63,7 @@
 ## 下载格式回退
 
 对 B站等格式组合不稳定的平台，yt-dlp 会使用多轮格式 fallback：优先小体积/低分辨率 MP4，失败后逐步放宽到站点可用的 best/worst 格式，并继续受 `limits.max_file_size_mb` 约束。
+
+## 低清下载优先
+
+为了降低 OpenRouter base64 请求体大小，插件下载视频时会优先选择最小可用分辨率的视频流并合并音频；若站点没有对应格式，会逐步放宽格式选择。最终文件仍受 `limits.max_file_size_mb` 与 `openrouter.max_base64_video_mb` 限制。

@@ -304,7 +304,7 @@ class VideoSummaryPlugin(Star):
                     # Prefer small, compatible outputs when the site exposes a
                     # choice, but do not fail solely because an exact 480p mp4
                     # combination is unavailable.
-                    "format_sort": ["res:480", "vcodec:avc", "ext:mp4:m4a"],
+                    "format_sort": ["+res", "vcodec:avc", "ext:mp4:m4a"],
                 }
             )
         else:
@@ -313,12 +313,17 @@ class VideoSummaryPlugin(Star):
 
     @staticmethod
     def _download_format_selectors() -> list[str]:
+        # OpenRouter base64 video input is request-body sensitive, so smallest
+        # usable video is more valuable than quality. Prefer the lowest
+        # resolution video-only stream plus audio, then progressively relax.
         return [
-            "bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
-            "bestvideo[height<=720][vcodec^=avc1]+bestaudio/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-            "bestvideo+bestaudio/best",
+            "worstvideo[vcodec^=avc1]+bestaudio[ext=m4a]/worstvideo[vcodec^=avc1]+bestaudio/worst[ext=mp4]/worst",
             "worstvideo+bestaudio/worst",
-            "best/worst",
+            "bestvideo[height<=240]+bestaudio/best[height<=240]/worst",
+            "bestvideo[height<=360]+bestaudio/best[height<=360]/worst",
+            "bestvideo[height<=480]+bestaudio/best[height<=480]/worst",
+            "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "bestvideo+bestaudio/best",
         ]
 
     async def _extract_info(self, url: str) -> dict:

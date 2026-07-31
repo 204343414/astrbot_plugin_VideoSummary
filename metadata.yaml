@@ -1,6 +1,6 @@
 name: astrbot_plugin_VideoSummary
 display_name: OpenRouter 视频分析
 desc: 使用 OpenRouter video_url 分析视频 URL，并以图片卡片输出摘要。
-version: 0.3.2
+version: 0.3.3
 author: "204343414"
 repo: "https://github.com/204343414/astrbot_plugin_VideoSummary"
