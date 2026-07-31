@@ -42,7 +42,7 @@ LEGACY_NON_VIDEO_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
     PLUGIN_NAME,
     "204343414",
     "OpenRouter Omni 视频内容分析与安全摘要",
-    "0.3.2",
+    "0.4.2",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -335,10 +335,15 @@ class VideoSummaryPlugin(Star):
         value = self._cookie_config_for_url(url)
         if not value:
             return None, None
-        if ("\\n" in value or "\\t" in value) and "\n" not in value:
-            value = value.replace("\\n", "\n").replace("\\t", "\t")
+
+        # Same cookie semantics as the yt-dlp downloader plugin: support
+        # cookies.txt text, existing cookie file path, and Cookie request header.
+        # Extra sanitation is applied before any path probing because QQ/Markdown
+        # renderers may turn domains into links like [.bilibili.com](http://...).
+        value = self._sanitize_cookie_text(value)
         lowered = value.lower().lstrip()
         key = self._cookie_key_for_url(url)
+
         if "\n" in value or lowered.startswith("# netscape") or "\t" in value:
             cookie_path = self.cookie_dir / f"{key}.cookies.txt"
             cookie_path.write_text(value.rstrip() + "\n", encoding="utf-8")
@@ -347,12 +352,14 @@ class VideoSummaryPlugin(Star):
             except OSError:
                 pass
             return str(cookie_path), None
+
         try:
             expanded = Path(os.path.expanduser(value))
             if expanded.exists():
                 return str(expanded), None
         except OSError:
             pass
+
         if lowered.startswith("cookie:"):
             value = value.split(":", 1)[1].strip()
         if ";" in value and "=" in value:
