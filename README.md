@@ -67,3 +67,20 @@
 ## 低清下载优先
 
 为了降低 OpenRouter base64 请求体大小，插件下载视频时会优先选择最小可用分辨率的视频流并合并音频；若站点没有对应格式，会逐步放宽格式选择。最终文件仍受 `limits.max_file_size_mb` 与 `openrouter.max_base64_video_mb` 限制。
+
+## yt-dlp Cookies
+
+和下载插件一致，视频分析也支持在 JSON 中配置 cookies：
+
+```json
+{
+  "cookies": {
+    "bilibili": "# Netscape HTTP Cookie File...",
+    "douyin": "...",
+    "youtube": "...",
+    "generic": "..."
+  }
+}
+```
+
+可以粘贴 Netscape cookies.txt 全文、浏览器 Cookie 请求头，或服务器上的 cookies.txt 文件路径。用于解决 B站/b23 412、抖音风控、YouTube 登录限制等。

@@ -106,6 +106,15 @@ class VideoSummaryPlugin(Star):
         self.youtube_direct_url = bool(openrouter.get("youtube_direct_url", False))
         self.non_youtube_base64 = bool(openrouter.get("non_youtube_use_base64", True))
         self.max_base64_video_mb = max(float(openrouter.get("max_base64_video_mb", 15)), 1.0)
+        self.try_direct_media_url = bool(openrouter.get("try_direct_media_url", True))
+
+        cookies = config.get("cookies", {}) or {}
+        self.bilibili_cookies = str(cookies.get("bilibili", "") or "").strip()
+        self.douyin_cookies = str(cookies.get("douyin", "") or "").strip()
+        self.youtube_cookies = str(cookies.get("youtube", "") or "").strip()
+        self.generic_cookies = str(cookies.get("generic", "") or "").strip()
+        self.cookie_dir = self.data_dir / "cookies"
+        self.cookie_dir.mkdir(parents=True, exist_ok=True)
 
         prompts = config.get("prompts", {}) or {}
         self.default_task_prompt = str(
@@ -281,6 +290,74 @@ class VideoSummaryPlugin(Star):
             except OSError:
                 pass
 
+    def _cookie_key_for_url(self, url: str) -> str:
+        try:
+            from urllib.parse import urlsplit
+            host = urlsplit(url).netloc.lower()
+        except Exception:
+            host = ""
+        if "bilibili" in host or "b23.tv" in host:
+            return "bilibili"
+        if "douyin" in host:
+            return "douyin"
+        if "youtube" in host or "youtu.be" in host:
+            return "youtube"
+        return "generic"
+
+    def _cookie_config_for_url(self, url: str) -> str:
+        key = self._cookie_key_for_url(url)
+        if key == "bilibili":
+            return self.bilibili_cookies or self.generic_cookies
+        if key == "douyin":
+            return self.douyin_cookies or self.generic_cookies
+        if key == "youtube":
+            return self.youtube_cookies or self.generic_cookies
+        return self.generic_cookies
+
+    def _resolve_cookie_for_ytdlp(self, url: str) -> tuple[str | None, str | None]:
+        value = self._cookie_config_for_url(url)
+        if not value:
+            return None, None
+        if ("\\n" in value or "\\t" in value) and "\n" not in value:
+            value = value.replace("\\n", "\n").replace("\\t", "\t")
+        lowered = value.lower().lstrip()
+        key = self._cookie_key_for_url(url)
+        if "\n" in value or lowered.startswith("# netscape") or "\t" in value:
+            cookie_path = self.cookie_dir / f"{key}.cookies.txt"
+            cookie_path.write_text(value.rstrip() + "\n", encoding="utf-8")
+            try:
+                cookie_path.chmod(0o600)
+            except OSError:
+                pass
+            return str(cookie_path), None
+        try:
+            expanded = Path(os.path.expanduser(value))
+            if expanded.exists():
+                return str(expanded), None
+        except OSError:
+            pass
+        if lowered.startswith("cookie:"):
+            value = value.split(":", 1)[1].strip()
+        if ";" in value and "=" in value:
+            return None, value
+        raise ValueError("cookies 配置既不是已存在路径，也不像 cookies.txt 或 Cookie 请求头")
+
+    def _ydl_headers(self, url: str) -> dict[str, str]:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        key = self._cookie_key_for_url(url)
+        if key == "bilibili":
+            headers["Referer"] = "https://www.bilibili.com/"
+        elif key == "douyin":
+            headers["Referer"] = "https://www.douyin.com/"
+        return headers
+
     def _ydl_opts(
         self,
         url: str,
@@ -294,16 +371,19 @@ class VideoSummaryPlugin(Star):
             "no_warnings": True,
             "noplaylist": True,
             "nocheckcertificate": True,
+            "http_headers": self._ydl_headers(url),
         }
+        cookiefile, cookie_header = self._resolve_cookie_for_ytdlp(url)
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
+        if cookie_header:
+            opts["http_headers"]["Cookie"] = cookie_header
         if download:
             opts.update(
                 {
                     "outtmpl": outtmpl,
                     "format": format_selector or self._download_format_selectors()[0],
                     "merge_output_format": "mp4",
-                    # Prefer small, compatible outputs when the site exposes a
-                    # choice, but do not fail solely because an exact 480p mp4
-                    # combination is unavailable.
                     "format_sort": ["+res", "vcodec:avc", "ext:mp4:m4a"],
                 }
             )
@@ -313,15 +393,16 @@ class VideoSummaryPlugin(Star):
 
     @staticmethod
     def _download_format_selectors() -> list[str]:
-        # OpenRouter base64 video input is request-body sensitive, so smallest
-        # usable video is more valuable than quality. Prefer the lowest
-        # resolution video-only stream plus audio, then progressively relax.
+        # Prefer smallest progressive (audio+video in one file) first.  If the
+        # site only exposes DASH/HLS split streams, fall back to video+audio and
+        # let yt-dlp/ffmpeg merge.  This minimizes OpenRouter base64 payloads.
         return [
+            "worst[ext=mp4][vcodec!=none][acodec!=none]/worst[vcodec!=none][acodec!=none]",
             "worstvideo[vcodec^=avc1]+bestaudio[ext=m4a]/worstvideo[vcodec^=avc1]+bestaudio/worst[ext=mp4]/worst",
             "worstvideo+bestaudio/worst",
-            "bestvideo[height<=240]+bestaudio/best[height<=240]/worst",
-            "bestvideo[height<=360]+bestaudio/best[height<=360]/worst",
-            "bestvideo[height<=480]+bestaudio/best[height<=480]/worst",
+            "best[height<=240][vcodec!=none][acodec!=none]/bestvideo[height<=240]+bestaudio/best[height<=240]/worst",
+            "best[height<=360][vcodec!=none][acodec!=none]/bestvideo[height<=360]+bestaudio/best[height<=360]/worst",
+            "best[height<=480][vcodec!=none][acodec!=none]/bestvideo[height<=480]+bestaudio/best[height<=480]/worst",
             "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
             "bestvideo+bestaudio/best",
         ]
@@ -495,7 +576,6 @@ class VideoSummaryPlugin(Star):
             video_ref = self._video_data_url(video_path)
         else:
             raise RuntimeError("当前 OpenRouter 配置无法为该 URL 构造视频输入。")
-        used = self._charge_usage(user_id)
         prompt = self._build_prompt(user_question)
         messages = [
             {
@@ -509,6 +589,7 @@ class VideoSummaryPlugin(Star):
         text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
         if not text:
             raise RuntimeError("OpenRouter 未返回文本结果")
+        used = self._charge_usage(user_id)
         return text, used
 
     def _build_prompt(self, user_question: str) -> str:

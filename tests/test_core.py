@@ -91,6 +91,22 @@ class VideoSummaryCoreTests(unittest.TestCase):
         question, url = plugin._split_question_and_url(raw)
         self.assertEqual(question, "这个视频内容")
         self.assertEqual(url, "https://www.bilibili.com/video/BV1kW411d7cD/")
+    def test_download_format_prefers_progressive_then_split_streams(self):
+        selectors = self.mod.VideoSummaryPlugin._download_format_selectors()
+        self.assertIn("acodec!=none", selectors[0])
+        self.assertTrue(any("+bestaudio" in item for item in selectors[1:]))
+
+    def test_escaped_cookie_text_supported(self):
+        plugin = self.mod.VideoSummaryPlugin.__new__(self.mod.VideoSummaryPlugin)
+        plugin.data_dir = Path(tempfile.mkdtemp())
+        plugin.cookie_dir = plugin.data_dir / "cookies"
+        plugin.cookie_dir.mkdir(parents=True, exist_ok=True)
+        plugin.bilibili_cookies = "# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tFALSE\t0\tSESSDATA\tabc"
+        plugin.douyin_cookies = plugin.youtube_cookies = plugin.generic_cookies = ""
+        cookiefile, header = plugin._resolve_cookie_for_ytdlp("https://b23.tv/abc")
+        self.assertIsNone(header)
+        self.assertIn("SESSDATA", Path(cookiefile).read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

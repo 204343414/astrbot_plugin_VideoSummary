@@ -53,6 +53,12 @@
         "description": "OpenRouter base64 视频最大 MB",
         "type": "float",
         "default": 15
+      },
+      "try_direct_media_url": {
+        "description": "尝试使用 yt-dlp 解析出的媒体直链",
+        "type": "bool",
+        "default": true,
+        "hint": "预留项：未来可在判定直链无需 Cookie/Referer 时直接传 URL，减少 base64 体积。当前主要路径仍是下载后 base64。"
       }
     }
   },
@@ -141,6 +147,41 @@
         "description": "免责声明",
         "type": "text",
         "default": "您请求的视频内容摘要已生成。以下内容由 AI 基于可见/可听信息自动整理，仅供参考，不代表事实核验或平台立场。"
+      }
+    }
+  },
+  "cookies": {
+    "description": "yt-dlp Cookies（可选）",
+    "type": "object",
+    "hint": "支持粘贴 Netscape cookies.txt 全文、浏览器 Cookie 请求头，或填写服务器 cookies.txt 路径。用于 B站 412、抖音风控、YouTube 登录限制等。",
+    "items": {
+      "bilibili": {
+        "description": "Bilibili/b23 cookies.txt / Cookie 请求头 / 文件路径",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "text",
+        "default": ""
+      },
+      "douyin": {
+        "description": "Douyin cookies.txt / Cookie 请求头 / 文件路径",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "text",
+        "default": ""
+      },
+      "youtube": {
+        "description": "YouTube cookies.txt / Cookie 请求头 / 文件路径",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "text",
+        "default": ""
+      },
+      "generic": {
+        "description": "通用 cookies.txt / Cookie 请求头 / 文件路径",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "text",
+        "default": ""
       }
     }
   }
