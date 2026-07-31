@@ -1,4 +1,73 @@
 {
+  "backend": {
+    "description": "分析后端",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "后端模式",
+        "type": "string",
+        "options": [
+          "qwen_video",
+          "openrouter_video"
+        ],
+        "default": "qwen_video",
+        "hint": "qwen_video=阿里百炼/Qwen OpenAI兼容视频理解；openrouter_video=OpenRouter video_url。"
+      }
+    }
+  },
+  "qwen": {
+    "description": "阿里百炼 / Qwen 视频理解",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "AstrBot OpenAI兼容 Provider ID",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "选择你配置的阿里/Qwen Provider，例如“阿里”。也兼容手填 阿里/qwen3.5-omni-flash-2026-03-15。"
+      },
+      "api_key": {
+        "description": "Qwen API Key（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "选择 provider_id 时可留空复用 Provider 的 key。"
+      },
+      "base_url": {
+        "description": "Qwen OpenAI兼容 Base URL",
+        "type": "string",
+        "default": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "hint": "国内百炼常用 https://dashscope.aliyuncs.com/compatible-mode/v1；国际/Workspace 按控制台给出的 compatible-mode/v1 地址。"
+      },
+      "model": {
+        "description": "Qwen 视频模型",
+        "type": "string",
+        "default": "qwen3.5-omni-flash-2026-03-15"
+      },
+      "fps": {
+        "description": "视频抽帧 fps",
+        "type": "float",
+        "default": 1,
+        "hint": "Qwen 视频输入的 fps 参数。静态/短视频 1 即可，运动快可调高。"
+      },
+      "stream": {
+        "description": "使用流式请求",
+        "type": "bool",
+        "default": true,
+        "hint": "Qwen-Omni 系列通常建议/要求流式。"
+      },
+      "base64_prefix": {
+        "description": "Base64 视频前缀",
+        "type": "string",
+        "default": "data:;base64,",
+        "hint": "qwen3.5-omni 文档示例使用 data:;base64,；部分 VL 模型也支持 data:video/mp4;base64,"
+      },
+      "max_base64_video_mb": {
+        "description": "Qwen base64 视频最大 MB",
+        "type": "float",
+        "default": 15
+      }
+    }
+  },
   "openrouter": {
     "description": "OpenRouter Omni 视频理解",
     "type": "object",

@@ -1,8 +1,8 @@
-"""OpenRouter Omni video summary plugin for AstrBot.
+"""Qwen/OpenRouter video summary plugin for AstrBot.
 
-Specialized for OpenRouter ``video_url`` input via OpenAI-compatible
-``/chat/completions``.  The plugin intentionally keeps only this backend so the
-runtime behavior and diagnostics stay easy to reason about.
+Specialized for OpenAI-compatible ``video_url`` input via ``/chat/completions``.
+The default backend targets Alibaba Qwen Omni/VL video understanding; OpenRouter
+Omni remains available as a fallback backend.
 """
 from __future__ import annotations
 
@@ -41,8 +41,8 @@ LEGACY_NON_VIDEO_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
 @register(
     PLUGIN_NAME,
     "204343414",
-    "OpenRouter Omni 视频内容分析与安全摘要",
-    "0.4.2",
+    "Qwen 视频内容分析与安全摘要",
+    "0.5.0",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -108,6 +108,31 @@ class VideoSummaryPlugin(Star):
         self.max_base64_video_mb = max(float(openrouter.get("max_base64_video_mb", 15)), 1.0)
         self.try_direct_media_url = bool(openrouter.get("try_direct_media_url", True))
 
+        qwen = config.get("qwen", {}) or {}
+        self.qwen_provider_id = str(qwen.get("provider_id", "") or "").strip()
+        self.qwen_api_key = str(qwen.get("api_key", "") or "").strip()
+        self.qwen_base_url = str(
+            qwen.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+            or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        ).strip().rstrip("/")
+        self.qwen_model = str(
+            qwen.get("model", "qwen3.5-omni-flash-2026-03-15")
+            or "qwen3.5-omni-flash-2026-03-15"
+        ).strip()
+        if "/" in self.qwen_provider_id and not self.qwen_api_key:
+            provider_part, model_part = self.qwen_provider_id.split("/", 1)
+            if provider_part:
+                self.qwen_provider_id = provider_part
+                if model_part:
+                    self.qwen_model = model_part
+        self.qwen_fps = max(float(qwen.get("fps", 1)), 0.1)
+        self.qwen_stream = bool(qwen.get("stream", True))
+        self.qwen_base64_prefix = str(qwen.get("base64_prefix", "data:;base64,") or "data:;base64,")
+        self.qwen_max_base64_video_mb = max(float(qwen.get("max_base64_video_mb", 15)), 1.0)
+
+        backend = config.get("backend", {}) or {}
+        self.backend_mode = str(backend.get("mode", "qwen_video") or "qwen_video").strip().lower()
+
         cookies = config.get("cookies", {}) or {}
         self.bilibili_cookies = str(cookies.get("bilibili", "") or "").strip()
         self.douyin_cookies = str(cookies.get("douyin", "") or "").strip()
@@ -138,7 +163,9 @@ class VideoSummaryPlugin(Star):
 
         self._cleanup_stale_temp()
         logger.info(
-            "[VideoSummary] loaded backend=openrouter_omni model=%s max_duration=%smin max_size=%sMB daily=%s public_domestic_only=%s",
+            "[VideoSummary] loaded backend=%s qwen_model=%s openrouter_model=%s max_duration=%smin max_size=%sMB daily=%s public_domestic_only=%s",
+            self.backend_mode,
+            self.qwen_model,
             self.openrouter_model,
             self.max_duration_minutes,
             self.max_file_size_mb,
@@ -649,6 +676,134 @@ class VideoSummaryPlugin(Star):
         used = self._charge_usage(user_id)
         return text, used
 
+    async def _resolve_qwen_config(self, event: AstrMessageEvent) -> tuple[str, str, str, int, dict]:
+        provider = None
+        if self.qwen_provider_id:
+            provider = await self.context.provider_manager.get_provider_by_id(self.qwen_provider_id)
+            if provider is None:
+                raise RuntimeError(f"未找到 Qwen/OpenAI Provider: {self.qwen_provider_id}")
+        api_key = self.qwen_api_key
+        base_url = self.qwen_base_url
+        model = self.qwen_model
+        timeout = 120
+        custom_headers = {}
+        if provider is not None:
+            if not api_key:
+                if hasattr(provider, "get_current_key"):
+                    api_key = str(provider.get_current_key() or "")
+                if not api_key:
+                    api_key = str(getattr(provider, "chosen_api_key", "") or "")
+                if not api_key:
+                    keys = getattr(provider, "api_keys", []) or []
+                    api_key = str(keys[0]) if keys else ""
+            provider_config = getattr(provider, "provider_config", {}) or {}
+            if not model:
+                model = str(getattr(provider, "get_model", lambda: "")() or provider_config.get("model", "") or "")
+            if not base_url or base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1":
+                client = getattr(provider, "client", None)
+                client_base = str(getattr(client, "base_url", "") or "").rstrip("/")
+                base_url = client_base or str(provider_config.get("api_base", "") or base_url).rstrip("/")
+            timeout = int(getattr(provider, "timeout", provider_config.get("timeout", 120)) or 120)
+            custom_headers = dict(getattr(provider, "custom_headers", None) or provider_config.get("custom_headers", {}) or {})
+        if not api_key:
+            raise RuntimeError("Qwen API key 未配置；请填写 qwen.api_key 或 qwen.provider_id。")
+        if not model:
+            raise RuntimeError("Qwen model 未配置。")
+        return api_key, base_url.rstrip("/"), model, timeout, custom_headers
+
+    def _qwen_video_data_url(self, video_path: Path) -> str:
+        size_mb = video_path.stat().st_size / 1024 / 1024
+        if size_mb > self.qwen_max_base64_video_mb:
+            raise ValueError(
+                f"Qwen base64 视频上限 {self.qwen_max_base64_video_mb:.1f}MB，当前 {size_mb:.1f}MB"
+            )
+        encoded = base64.b64encode(video_path.read_bytes()).decode("ascii")
+        return f"{self.qwen_base64_prefix}{encoded}"
+
+    async def _qwen_chat(self, api_key: str, base_url: str, model: str, timeout_seconds: int, messages: list, custom_headers: dict | None = None) -> str:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if custom_headers:
+            headers.update({str(k): str(v) for k, v in custom_headers.items()})
+        payload = {"model": model, "messages": messages, "modalities": ["text"]}
+        if self.qwen_stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+        timeout = aiohttp.ClientTimeout(total=max(timeout_seconds, 30), connect=15)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.post(f"{base_url}/chat/completions", headers=headers, json=payload) as resp:
+                raw = await resp.text()
+                if resp.status >= 400:
+                    try:
+                        data = json.loads(raw)
+                        err = data.get("error") if isinstance(data, dict) else None
+                        msg = err.get("message") if isinstance(err, dict) else raw
+                    except Exception:
+                        msg = raw
+                    raise RuntimeError(f"Qwen HTTP {resp.status}: {str(msg)[:300]}")
+                if self.qwen_stream:
+                    parts = []
+                    for line in raw.splitlines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload_text = line[5:].strip()
+                        if not payload_text or payload_text == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(payload_text)
+                        except Exception:
+                            continue
+                        choices = chunk.get("choices") or []
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            content = delta.get("content")
+                            if isinstance(content, str):
+                                parts.append(content)
+                            elif isinstance(content, list):
+                                for item in content:
+                                    if isinstance(item, dict):
+                                        parts.append(str(item.get("text") or item.get("content") or ""))
+                    return "".join(parts).strip()
+                data = json.loads(raw)
+                choices = data.get("choices") or []
+                if not choices:
+                    raise RuntimeError(f"Qwen 未返回 choices: {str(data)[:300]}")
+                content = choices[0].get("message", {}).get("content", "")
+                if isinstance(content, str):
+                    return content.strip()
+                if isinstance(content, list):
+                    return "\n".join(str(x.get("text") or x.get("content") or "") for x in content if isinstance(x, dict)).strip()
+                return str(content).strip()
+
+    async def _analyze_with_qwen(
+        self,
+        event: AstrMessageEvent,
+        url: str,
+        video_path: Path | None,
+        user_question: str,
+        user_id: str,
+    ) -> tuple[str, int]:
+        api_key, base_url, model, timeout, custom_headers = await self._resolve_qwen_config(event)
+        if video_path is None:
+            video_ref = url
+        else:
+            video_ref = self._qwen_video_data_url(video_path)
+        item = {"type": "video_url", "video_url": {"url": video_ref}, "fps": self.qwen_fps}
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": self._build_prompt(user_question)},
+                    item,
+                ],
+            }
+        ]
+        text = await self._qwen_chat(api_key, base_url, model, timeout, messages, custom_headers)
+        if not text:
+            raise RuntimeError("Qwen 未返回文本结果")
+        used = self._charge_usage(user_id)
+        return text, used
+
     def _build_prompt(self, user_question: str) -> str:
         task = str(user_question or "").strip() or self.default_task_prompt
         return f"{task}\n{self.tail_instruction_prompt}"
@@ -747,24 +902,76 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
         except Exception as exc:
             return "FAIL：" + self._short_error(exc)
 
-    async def _probe_openrouter_video_url(self, event: AstrMessageEvent, url: str) -> str:
+    async def _probe_qwen_text(self, event: AstrMessageEvent) -> str:
+        try:
+            api_key, base_url, model, timeout, custom_headers = await self._resolve_qwen_config(event)
+            messages = [{"role": "user", "content": "请只回复 PONG"}]
+            text = await self._qwen_chat(api_key, base_url, model, timeout, messages, custom_headers)
+            return f"OK：model={model} key={self._mask_secret(api_key)} base={base_url} resp={text[:80] or '<empty>'}"
+        except Exception as exc:
+            return "FAIL：" + self._short_error(exc)
+
+    async def _probe_direct_video_url(self, event: AstrMessageEvent, url: str, backend: str) -> str:
         if not url:
             return "SKIP：未提供 URL"
         try:
-            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "请用中文用一句话描述这个视频。"},
-                        {"type": "video_url", "video_url": {"url": url}},
-                    ],
-                }
-            ]
-            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
+            if backend == "qwen_video":
+                text, _used = await self._analyze_with_qwen(event, url, None, "请用中文用一句话描述这个视频。", "__diag__")
+            else:
+                text, _used = await self._analyze_with_openrouter(event, url, None, "请用中文用一句话描述这个视频。", "__diag__")
+            # Roll back diagnostic charge if any. It may create __diag__ usage.
+            self.usage.get("users", {}).pop("__diag__", None)
+            self._save_usage()
             return f"OK：{text[:160] or '<empty>'}"
         except Exception as exc:
+            self.usage.get("users", {}).pop("__diag__", None)
+            self._save_usage()
             return "FAIL：" + self._short_error(exc)
+
+    async def _probe_base64_video(self, event: AstrMessageEvent, url: str, backend: str) -> str:
+        if not url:
+            return "SKIP：未提供 URL"
+        task_id = f"diag_{int(time.time() * 1000)}"
+        try:
+            video_path, _info = await self._download_video(url, task_id)
+            size_mb = video_path.stat().st_size / 1024 / 1024
+            if backend == "qwen_video":
+                if size_mb > self.qwen_max_base64_video_mb:
+                    return f"SKIP：下载后 {size_mb:.1f}MB，超过 qwen.max_base64_video_mb={self.qwen_max_base64_video_mb:.1f}MB"
+                text, _used = await self._analyze_with_qwen(event, url, video_path, "请用中文用一句话描述这个视频。", "__diag__")
+            else:
+                if size_mb > self.max_base64_video_mb:
+                    return f"SKIP：下载后 {size_mb:.1f}MB，超过 openrouter.max_base64_video_mb={self.max_base64_video_mb:.1f}MB"
+                text, _used = await self._analyze_with_openrouter(event, url, video_path, "请用中文用一句话描述这个视频。", "__diag__")
+            self.usage.get("users", {}).pop("__diag__", None)
+            self._save_usage()
+            return f"OK：file={size_mb:.1f}MB resp={text[:160] or '<empty>'}"
+        except Exception as exc:
+            self.usage.get("users", {}).pop("__diag__", None)
+            self._save_usage()
+            return "FAIL：" + self._short_error(exc)
+        finally:
+            for path in self.temp_dir.glob(f"{task_id}_*"):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+    def _active_backend(self) -> str:
+        return "qwen_video" if self.backend_mode in {"qwen", "qwen_video"} else "openrouter_video"
+
+    async def _analyze_with_backend(
+        self,
+        backend: str,
+        event: AstrMessageEvent,
+        url: str,
+        video_path: Path | None,
+        question: str,
+        user_id: str,
+    ) -> tuple[str, int]:
+        if backend == "qwen_video":
+            return await self._analyze_with_qwen(event, url, video_path, question, user_id)
+        return await self._analyze_with_openrouter(event, url, video_path, question, user_id)
 
     @filter.command("视频分析")
     async def video_analyze(self, event: AstrMessageEvent, text: GreedyStr):
@@ -793,6 +1000,7 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
         async with self._semaphore:
             task_id = str(int(time.time() * 1000))
             video_path: Path | None = None
+            backend = self._active_backend()
             try:
                 info = await self._extract_info(url)
                 domestic = self._is_domestic_url_or_info(url, info)
@@ -811,20 +1019,25 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                 if direct_media_url:
                     try:
                         logger.info(
-                            "[VideoSummary] trying progressive direct media url format=%s height=%s size=%s",
+                            "[VideoSummary] trying progressive direct media url backend=%s format=%s height=%s size=%s",
+                            backend,
                             direct_fmt.get("format_id"),
                             direct_fmt.get("height"),
                             direct_fmt.get("filesize") or direct_fmt.get("filesize_approx"),
                         )
-                        analysis, used = await self._analyze_with_openrouter(event, direct_media_url, None, question, user_id)
+                        analysis, used = await self._analyze_with_backend(
+                            backend, event, direct_media_url, None, question, user_id
+                        )
                     except Exception as direct_exc:
                         logger.warning(
-                            "[VideoSummary] OpenRouter progressive media URL failed, falling back to yt-dlp base64: %s",
+                            "[VideoSummary] progressive media URL failed, falling back to yt-dlp base64: %s",
                             direct_exc,
                         )
                         video_path, downloaded_info = await self._download_video(url, task_id)
-                        analysis, used = await self._analyze_with_openrouter(event, url, video_path, question, user_id)
-                elif self.youtube_direct_url and self._is_youtube_url(url):
+                        analysis, used = await self._analyze_with_backend(
+                            backend, event, url, video_path, question, user_id
+                        )
+                elif self.youtube_direct_url and self._is_youtube_url(url) and backend == "openrouter_video":
                     try:
                         analysis, used = await self._analyze_with_openrouter(event, url, None, question, user_id)
                     except Exception as direct_exc:
@@ -833,15 +1046,19 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                             direct_exc,
                         )
                         video_path, downloaded_info = await self._download_video(url, task_id)
-                        analysis, used = await self._analyze_with_openrouter(event, url, video_path, question, user_id)
+                        analysis, used = await self._analyze_with_backend(
+                            backend, event, url, video_path, question, user_id
+                        )
                 else:
                     video_path, downloaded_info = await self._download_video(url, task_id)
-                    analysis, used = await self._analyze_with_openrouter(event, url, video_path, question, user_id)
+                    analysis, used = await self._analyze_with_backend(
+                        backend, event, url, video_path, question, user_id
+                    )
 
                 title = str(downloaded_info.get("title") or info.get("title") or self.card_title)
                 image = await self._render_card(title, analysis, url, safe=not self._looks_refusal(analysis))
                 yield event.image_result(image)
-                logger.info("[VideoSummary] success user=%s used=%s url=%s", user_id, used, url)
+                logger.info("[VideoSummary] success backend=%s user=%s used=%s url=%s", backend, user_id, used, url)
             except Exception as exc:
                 logger.exception("[VideoSummary] failed")
                 yield event.plain_result(f"视频分析失败：{type(exc).__name__}: {exc}")
@@ -852,43 +1069,12 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                     except OSError:
                         pass
 
-    async def _probe_openrouter_base64_video(self, event: AstrMessageEvent, url: str) -> str:
-        if not url:
-            return "SKIP：未提供 URL"
-        task_id = f"diag_{int(time.time() * 1000)}"
-        video_path: Path | None = None
-        try:
-            video_path, _info = await self._download_video(url, task_id)
-            size_mb = video_path.stat().st_size / 1024 / 1024
-            if size_mb > self.max_base64_video_mb:
-                return f"SKIP：下载后 {size_mb:.1f}MB，超过 max_base64_video_mb={self.max_base64_video_mb:.1f}MB"
-            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
-            video_ref = self._video_data_url(video_path)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "请用中文用一句话描述这个视频。"},
-                        {"type": "video_url", "video_url": {"url": video_ref}},
-                    ],
-                }
-            ]
-            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
-            return f"OK：file={size_mb:.1f}MB resp={text[:160] or '<empty>'}"
-        except Exception as exc:
-            return "FAIL：" + self._short_error(exc)
-        finally:
-            for path in self.temp_dir.glob(f"{task_id}_*"):
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-
     @filter.command("视频分析自检")
     async def diagnostics(self, event: AstrMessageEvent, text: GreedyStr = ""):
-        """自检 OpenRouter Omni、yt-dlp 和配置。"""
+        """自检当前后端、yt-dlp 和配置。"""
         event.stop_event()
-        lines: list[str] = ["🧪 视频分析插件自检（OpenRouter Omni 专精）"]
+        backend = self._active_backend()
+        lines: list[str] = [f"🧪 视频分析插件自检（{backend}）"]
         raw = str(text or "")
         _question, url = self._split_question_and_url(raw)
         if not url:
@@ -897,9 +1083,14 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
             except Exception:
                 pass
         lines.append(f"URL：{url or '未提供'}")
-        lines.append("OpenRouter 文本：" + await self._probe_openrouter_text(event))
-        lines.append("OpenRouter 直接视频URL：" + await self._probe_openrouter_video_url(event, url))
-        lines.append("OpenRouter 下载后base64视频：" + await self._probe_openrouter_base64_video(event, url))
+        if backend == "qwen_video":
+            lines.append("Qwen 文本：" + await self._probe_qwen_text(event))
+            lines.append("Qwen 直接视频URL：" + await self._probe_direct_video_url(event, url, "qwen_video"))
+            lines.append("Qwen 下载后base64视频：" + await self._probe_base64_video(event, url, "qwen_video"))
+        else:
+            lines.append("OpenRouter 文本：" + await self._probe_openrouter_text(event))
+            lines.append("OpenRouter 直接视频URL：" + await self._probe_direct_video_url(event, url, "openrouter_video"))
+            lines.append("OpenRouter 下载后base64视频：" + await self._probe_base64_video(event, url, "openrouter_video"))
         if url:
             try:
                 info = await self._extract_info(url)
@@ -907,9 +1098,14 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                 domestic = self._is_domestic_url_or_info(url, info)
                 subs = sorted((info.get("subtitles") or {}).keys())[:12]
                 auto_subs = sorted((info.get("automatic_captions") or {}).keys())[:12]
+                direct_url, direct_fmt = self._select_progressive_media_url(info)
+                direct_desc = "无"
+                if direct_url:
+                    direct_desc = f"format={direct_fmt.get('format_id')} height={direct_fmt.get('height')} ext={direct_fmt.get('ext')}"
                 lines.append(
                     f"yt-dlp 元信息：OK extractor={info.get('extractor') or info.get('extractor_key')} duration={duration/60:.1f}min domestic={domestic}"
                 )
+                lines.append(f"最小音画合一直链：{direct_desc}")
                 lines.append(f"字幕：manual={subs or '无'} auto={auto_subs or '无'}")
                 if duration and duration > self.max_duration_minutes * 60:
                     lines.append(f"限制：WARN 视频超过 max_duration_minutes={self.max_duration_minutes}")
