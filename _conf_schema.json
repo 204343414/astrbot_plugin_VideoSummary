@@ -1,36 +1,20 @@
 {
-  "backend": {
-    "description": "分析后端",
-    "type": "object",
-    "items": {
-      "mode": {
-        "description": "后端模式",
-        "type": "string",
-        "options": [
-          "auto",
-          "gemini_files",
-          "openrouter_video"
-        ],
-        "default": "openrouter_video",
-        "hint": "默认专精 OpenRouter video_url；gemini_files=Google Gemini Files API；auto=配置了 OpenRouter 就优先 OpenRouter，否则 Gemini Files API。"
-      }
-    }
-  },
   "openrouter": {
-    "description": "OpenRouter 视频输入",
+    "description": "OpenRouter Omni 视频理解",
     "type": "object",
     "items": {
       "provider_id": {
-        "description": "AstrBot OpenAI兼容 Provider ID（可选）",
+        "description": "AstrBot OpenAI兼容 Provider ID",
         "type": "string",
         "default": "",
-        "hint": "选择 AstrBot 里配置的 OpenAI 兼容 Provider，例如 openai_2。注意它是字符串 ID，不是数字 2。也兼容手填 openai_2/nvidia/xxx:free，但推荐 provider_id 和 model 分开填。",
-        "_special": "select_provider"
+        "_special": "select_provider",
+        "hint": "推荐选择 openai_2 这类已配置 OpenRouter 的 Provider。Provider ID 是完整字符串，不是数字。也兼容手填 openai_2/nvidia/xxx:free。"
       },
       "api_key": {
         "description": "OpenRouter API Key（可选）",
         "type": "string",
-        "default": ""
+        "default": "",
+        "hint": "如果已选择 provider_id，可留空复用 Provider 的 key。"
       },
       "base_url": {
         "description": "OpenRouter Base URL",
@@ -38,10 +22,10 @@
         "default": "https://openrouter.ai/api/v1"
       },
       "model": {
-        "description": "OpenRouter 模型名",
+        "description": "OpenRouter Omni 视频模型",
         "type": "string",
         "default": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-        "hint": "默认使用 OpenRouter 上明确支持 video/audio/image/text 的 NVIDIA Omni free 模型。nvidia/nemotron-3-nano-30b-a3b:free 文本可用但自检显示不支持 video input。"
+        "hint": "本插件专精 OpenRouter video_url。nvidia/nemotron-3-nano-30b-a3b:free 文本可用但不支持 video input，请使用带 omni 的视频模型。"
       },
       "referer": {
         "description": "HTTP-Referer",
@@ -67,47 +51,6 @@
         "description": "OpenRouter base64 视频最大 MB",
         "type": "float",
         "default": 15
-      }
-    }
-  },
-  "gemini": {
-    "description": "Gemini 设置",
-    "type": "object",
-    "items": {
-      "provider_id": {
-        "description": "Gemini Provider ID（可选）",
-        "type": "string",
-        "default": "",
-        "_special": "select_provider",
-        "hint": "留空时使用当前会话 Provider；必须是 AstrBot 的 Google Gemini Provider。"
-      },
-      "model": {
-        "description": "Gemini 模型名（可选）",
-        "type": "string",
-        "default": "",
-        "hint": "留空时复用 Provider 模型。建议使用支持视频理解的 Gemini 模型。"
-      },
-      "api_base": {
-        "description": "Gemini API Base URL（可选）",
-        "type": "string",
-        "default": "",
-        "hint": "默认留空，使用 Google Gemini 官方地址。只有在你的代理明确支持 Gemini Files API 上传接口 /upload/v1beta/files 时才填写。"
-      },
-      "use_provider_api_base": {
-        "description": "继承 AstrBot Gemini Provider 的 api_base",
-        "type": "bool",
-        "default": false,
-        "hint": "默认关闭，避免把 OpenAI 兼容代理或不支持 Files API 的 Gemini 代理用于视频上传。若你的 Provider api_base 明确支持 Gemini Files API，可开启。"
-      },
-      "file_poll_timeout_seconds": {
-        "description": "视频文件处理等待超时秒数",
-        "type": "int",
-        "default": 180
-      },
-      "file_poll_interval_seconds": {
-        "description": "视频文件处理轮询间隔秒数",
-        "type": "float",
-        "default": 3
       }
     }
   },
@@ -196,34 +139,6 @@
         "description": "免责声明",
         "type": "text",
         "default": "您请求的视频内容摘要已生成。以下内容由 AI 基于可见/可听信息自动整理，仅供参考，不代表事实核验或平台立场。"
-      }
-    }
-  },
-  "stt": {
-    "description": "OpenAI 兼容语音转文字自检（可选）",
-    "type": "object",
-    "items": {
-      "enabled": {
-        "description": "启用 STT 自检",
-        "type": "bool",
-        "default": false
-      },
-      "api_base_url": {
-        "description": "OpenAI 兼容 API Base URL",
-        "type": "string",
-        "default": "",
-        "hint": "例如 https://api.example.com；自检会请求 /v1/audio/transcriptions。"
-      },
-      "api_key": {
-        "description": "OpenAI 兼容 API Key",
-        "type": "string",
-        "default": ""
-      },
-      "model": {
-        "description": "STT 模型名",
-        "type": "string",
-        "default": "whisper-1",
-        "hint": "也可尝试 gpt-4o-mini-transcribe、gpt-4o-transcribe，取决于中转站支持。"
       }
     }
   }

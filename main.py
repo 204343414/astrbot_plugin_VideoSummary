@@ -1,15 +1,14 @@
-"""Gemini video summary plugin for AstrBot.
+"""OpenRouter Omni video summary plugin for AstrBot.
 
-This plugin intentionally calls Gemini's Files API directly instead of going
-through AstrBot ProviderRequest: AstrBot v4.26.x has image/audio media fields,
-but no first-class video part in ProviderRequest.
+Specialized for OpenRouter ``video_url`` input via OpenAI-compatible
+``/chat/completions``.  The plugin intentionally keeps only this backend so the
+runtime behavior and diagnostics stay easy to reason about.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import html
-import wave
 import json
 import os
 import re
@@ -19,8 +18,6 @@ from pathlib import Path
 
 import aiohttp
 import yt_dlp
-from google import genai
-from google.genai import types
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -37,13 +34,15 @@ except Exception:  # pragma: no cover
     GreedyStr = str
 
 PLUGIN_NAME = "astrbot_plugin_VideoSummary"
+OMNI_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+LEGACY_NON_VIDEO_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
 
 
 @register(
     PLUGIN_NAME,
     "204343414",
-    "Gemini 视频内容分析与安全摘要",
-    "0.2.1",
+    "OpenRouter Omni 视频内容分析与安全摘要",
+    "0.3.0",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -71,13 +70,42 @@ class VideoSummaryPlugin(Star):
         self.allowed_group_openids = self._parse_values(access.get("allowed_group_openids", ""))
         self.allowed_instance_ids = self._parse_values(access.get("allowed_qqofficial_instance_ids", ""))
 
-        gemini = config.get("gemini", {}) or {}
-        self.provider_id = str(gemini.get("provider_id", "") or "").strip()
-        self.model = str(gemini.get("model", "") or "").strip()
-        self.api_base_override = str(gemini.get("api_base", "") or "").strip() or None
-        self.use_provider_api_base = bool(gemini.get("use_provider_api_base", False))
-        self.file_poll_timeout_seconds = max(int(gemini.get("file_poll_timeout_seconds", 180)), 30)
-        self.file_poll_interval_seconds = max(float(gemini.get("file_poll_interval_seconds", 3)), 1.0)
+        openrouter = config.get("openrouter", {}) or {}
+        self.openrouter_provider_id = str(openrouter.get("provider_id", "") or "").strip()
+        self.openrouter_api_key = str(openrouter.get("api_key", "") or "").strip()
+        self.openrouter_base_url = str(
+            openrouter.get("base_url", "https://openrouter.ai/api/v1")
+            or "https://openrouter.ai/api/v1"
+        ).strip().rstrip("/")
+        # Omni specialized: old non-video default is silently upgraded so stale
+        # WebUI config will not keep selecting a text-only free model.
+        configured_model = str(openrouter.get("model", "") or "").strip()
+        self.openrouter_model = configured_model or OMNI_MODEL
+        if self.openrouter_model == LEGACY_NON_VIDEO_MODEL or "omni" not in self.openrouter_model.lower():
+            logger.warning(
+                "[VideoSummary] OpenRouter model %s does not look like an Omni video model; forcing %s",
+                self.openrouter_model,
+                OMNI_MODEL,
+            )
+            self.openrouter_model = OMNI_MODEL
+
+        # Convenience: allow writing provider/model as one value, e.g.
+        # "openai_2/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".
+        if "/" in self.openrouter_provider_id and not self.openrouter_api_key:
+            provider_part, model_part = self.openrouter_provider_id.split("/", 1)
+            if provider_part:
+                self.openrouter_provider_id = provider_part
+                if model_part and "omni" in model_part.lower():
+                    self.openrouter_model = model_part
+
+        self.openrouter_referer = str(
+            openrouter.get("referer", "https://github.com/204343414/astrbot_plugin_VideoSummary")
+            or "https://github.com/204343414/astrbot_plugin_VideoSummary"
+        ).strip()
+        self.openrouter_title = str(openrouter.get("title", "AstrBot VideoSummary") or "AstrBot VideoSummary").strip()
+        self.youtube_direct_url = bool(openrouter.get("youtube_direct_url", True))
+        self.non_youtube_base64 = bool(openrouter.get("non_youtube_use_base64", True))
+        self.max_base64_video_mb = max(float(openrouter.get("max_base64_video_mb", 15)), 1.0)
 
         prompts = config.get("prompts", {}) or {}
         self.default_task_prompt = str(
@@ -99,45 +127,10 @@ class VideoSummaryPlugin(Star):
         ).strip()
         self.card_title = str(output.get("card_title", "AI 视频内容摘要")).strip()
 
-        stt = config.get("stt", {}) or {}
-        self.stt_enabled = bool(stt.get("enabled", False))
-        self.stt_api_base_url = str(stt.get("api_base_url", "") or "").strip().rstrip("/")
-        self.stt_api_key = str(stt.get("api_key", "") or "").strip()
-        self.stt_model = str(stt.get("model", "whisper-1") or "whisper-1").strip()
-
-        backend = config.get("backend", {}) or {}
-        self.backend_mode = str(backend.get("mode", "openrouter_video") or "openrouter_video").strip().lower()
-        openrouter = config.get("openrouter", {}) or {}
-        self.openrouter_provider_id = str(openrouter.get("provider_id", "") or "").strip()
-        self.openrouter_api_key = str(openrouter.get("api_key", "") or "").strip()
-        self.openrouter_base_url = str(
-            openrouter.get("base_url", "https://openrouter.ai/api/v1")
-            or "https://openrouter.ai/api/v1"
-        ).strip().rstrip("/")
-        self.openrouter_model = str(
-            openrouter.get("model", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
-            or "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-        ).strip()
-        # Convenience: allow writing provider/model as one value, e.g.
-        # "openai_2/nvidia/nemotron-3-nano-30b-a3b:free".
-        if "/" in self.openrouter_provider_id and not self.openrouter_api_key:
-            provider_part, model_part = self.openrouter_provider_id.split("/", 1)
-            if provider_part:
-                self.openrouter_provider_id = provider_part
-                if model_part:
-                    self.openrouter_model = model_part
-        self.openrouter_referer = str(
-            openrouter.get("referer", "https://github.com/204343414/astrbot_plugin_VideoSummary")
-            or "https://github.com/204343414/astrbot_plugin_VideoSummary"
-        ).strip()
-        self.openrouter_title = str(openrouter.get("title", "AstrBot VideoSummary") or "AstrBot VideoSummary").strip()
-        self.openrouter_youtube_direct_url = bool(openrouter.get("youtube_direct_url", True))
-        self.openrouter_non_youtube_base64 = bool(openrouter.get("non_youtube_use_base64", True))
-        self.openrouter_max_base64_video_mb = max(float(openrouter.get("max_base64_video_mb", 15)), 1.0)
-
         self._cleanup_stale_temp()
         logger.info(
-            "[VideoSummary] loaded max_duration=%smin max_size=%sMB daily=%s public_domestic_only=%s",
+            "[VideoSummary] loaded backend=openrouter_omni model=%s max_duration=%smin max_size=%sMB daily=%s public_domestic_only=%s",
+            self.openrouter_model,
             self.max_duration_minutes,
             self.max_file_size_mb,
             self.daily_limit_per_user,
@@ -340,55 +333,6 @@ class VideoSummaryPlugin(Star):
             raise ValueError(f"视频文件 {size_mb:.1f}MB，超过上限 {self.max_file_size_mb:.1f}MB")
         return path, info
 
-    async def _resolve_gemini_provider(self, event: AstrMessageEvent):
-        provider = None
-        if self.provider_id:
-            provider = await self.context.provider_manager.get_provider_by_id(self.provider_id)
-        if provider is None:
-            try:
-                provider = self.context.get_using_provider(event.unified_msg_origin)
-            except Exception:
-                provider = None
-        if provider is None:
-            raise RuntimeError("没有可用 Gemini Provider，请在插件配置 gemini.provider_id 或当前会话选择 Gemini Provider")
-        api_key = str(getattr(provider, "chosen_api_key", "") or "")
-        if not api_key and hasattr(provider, "get_current_key"):
-            api_key = str(provider.get_current_key() or "")
-        if not api_key:
-            keys = getattr(provider, "api_keys", []) or []
-            api_key = str(keys[0]) if keys else ""
-        model = self.model or str(getattr(provider, "get_model", lambda: "")() or "")
-        if not api_key:
-            raise RuntimeError("未能从 Gemini Provider 读取 API key")
-        if "gemini" not in model.lower():
-            raise RuntimeError(f"当前 Provider 模型不像 Gemini: {model}。请配置 gemini.provider_id/model")
-        provider_api_base = getattr(provider, "api_base", None) or getattr(provider, "provider_config", {}).get("api_base", None)
-        api_base = self.api_base_override or (provider_api_base if self.use_provider_api_base else None)
-        timeout = int(getattr(provider, "timeout", 180) or 180)
-        return api_key, model, api_base, timeout
-
-    def _has_openrouter_config(self) -> bool:
-        return bool(self.openrouter_api_key or self.openrouter_provider_id)
-
-    def _select_backend(self) -> str:
-        mode = self.backend_mode
-        if mode in {"openrouter", "openrouter_video"}:
-            return "openrouter_video"
-        if mode in {"gemini", "gemini_files"}:
-            return "gemini_files"
-        # auto: prefer OpenRouter only when explicitly configured.
-        return "openrouter_video" if self._has_openrouter_config() else "gemini_files"
-
-    @staticmethod
-    def _is_youtube_url(url: str) -> bool:
-        try:
-            from urllib.parse import urlsplit
-
-            host = urlsplit(url).netloc.lower()
-        except Exception:
-            return False
-        return "youtube.com" in host or "youtu.be" in host
-
     async def _resolve_openrouter_config(self, event: AstrMessageEvent) -> tuple[str, str, str, int, dict]:
         provider = None
         if self.openrouter_provider_id:
@@ -415,8 +359,6 @@ class VideoSummaryPlugin(Star):
             if not model:
                 model = str(getattr(provider, "get_model", lambda: "")() or provider_config.get("model", "") or "")
             if not base_url or base_url == "https://openrouter.ai/api/v1":
-                # If the provider is already an OpenRouter/OpenAI-compatible
-                # AstrBot provider, reuse its base_url.
                 client = getattr(provider, "client", None)
                 client_base = str(getattr(client, "base_url", "") or "").rstrip("/")
                 base_url = client_base or str(provider_config.get("api_base", "") or base_url).rstrip("/")
@@ -468,9 +410,9 @@ class VideoSummaryPlugin(Star):
 
     def _video_data_url(self, video_path: Path) -> str:
         size_mb = video_path.stat().st_size / 1024 / 1024
-        if size_mb > self.openrouter_max_base64_video_mb:
+        if size_mb > self.max_base64_video_mb:
             raise ValueError(
-                f"OpenRouter base64 视频上限 {self.openrouter_max_base64_video_mb:.1f}MB，当前 {size_mb:.1f}MB"
+                f"OpenRouter base64 视频上限 {self.max_base64_video_mb:.1f}MB，当前 {size_mb:.1f}MB"
             )
         encoded = base64.b64encode(video_path.read_bytes()).decode("ascii")
         return f"data:video/mp4;base64,{encoded}"
@@ -484,13 +426,12 @@ class VideoSummaryPlugin(Star):
         user_id: str,
     ) -> tuple[str, int]:
         api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
-        if self.openrouter_youtube_direct_url and self._is_youtube_url(url):
+        if self.youtube_direct_url and self._is_youtube_url(url):
             video_ref = url
-        elif video_path is not None and self.openrouter_non_youtube_base64:
+        elif video_path is not None and self.non_youtube_base64:
             video_ref = self._video_data_url(video_path)
         else:
             raise RuntimeError("当前 OpenRouter 配置无法为该 URL 构造视频输入。")
-        # Charge after we have a valid video reference for OpenRouter.
         used = self._charge_usage(user_id)
         prompt = self._build_prompt(user_question)
         messages = [
@@ -507,63 +448,14 @@ class VideoSummaryPlugin(Star):
             raise RuntimeError("OpenRouter 未返回文本结果")
         return text, used
 
-    async def _upload_and_wait_file(self, client, video_path: Path):
-        try:
-            uploaded = await asyncio.to_thread(client.files.upload, file=str(video_path))
-        except KeyError as exc:
-            raise RuntimeError(
-                "Gemini Files API 上传初始化失败：当前 api_base/代理可能不支持 /upload/v1beta/files。"
-                "请优先留空 gemini.api_base，并关闭 use_provider_api_base；若必须走代理，请确认代理支持 Gemini Files API。"
-            ) from exc
-        name = getattr(uploaded, "name", "")
-        deadline = time.monotonic() + self.file_poll_timeout_seconds
-        while True:
-            state = str(getattr(uploaded, "state", "") or "").upper()
-            if state.endswith("ACTIVE") or state == "ACTIVE":
-                return uploaded
-            if state.endswith("FAILED") or state == "FAILED":
-                raise RuntimeError("Gemini 文件处理失败")
-            if time.monotonic() >= deadline:
-                raise TimeoutError("等待 Gemini 处理视频超时")
-            await asyncio.sleep(self.file_poll_interval_seconds)
-            if not name:
-                raise RuntimeError("Gemini 文件上传未返回 name，无法轮询状态")
-            uploaded = await asyncio.to_thread(client.files.get, name=name)
-
     def _build_prompt(self, user_question: str) -> str:
         task = str(user_question or "").strip() or self.default_task_prompt
         return f"{task}\n{self.tail_instruction_prompt}"
 
-    async def _analyze_with_gemini(
-        self,
-        event: AstrMessageEvent,
-        video_path: Path,
-        user_question: str,
-        user_id: str,
-    ) -> tuple[str, int]:
-        api_key, model, api_base, timeout = await self._resolve_gemini_provider(event)
-        http_options = types.HttpOptions(base_url=api_base, timeout=timeout * 1000)
-        client = genai.Client(api_key=api_key, http_options=http_options)
-        uploaded = await self._upload_and_wait_file(client, video_path)
-        # Charge only after the video is accepted and processed by Gemini.
-        # Safety refusals generated by Gemini still consume quota.
-        used = self._charge_usage(user_id)
-        prompt = self._build_prompt(user_question)
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=model,
-            contents=[uploaded, prompt],
-        )
-        text = str(getattr(response, "text", "") or "").strip()
-        if not text:
-            raise RuntimeError("Gemini 未返回文本结果")
-        return text, used
-
     @staticmethod
     def _strip_command_prefix(text: str) -> str:
         text = str(text or "").strip()
-        # Works for raw strings like "/视频分析 ..." or after wake-prefix removal.
-        for prefix in ("/视频分析", "视频分析"):
+        for prefix in ("/视频分析", "视频分析", "/视频分析自检", "视频分析自检"):
             if text.startswith(prefix):
                 return text[len(prefix):].strip()
         return text
@@ -573,12 +465,20 @@ class VideoSummaryPlugin(Star):
         url = self._extract_first_url(text)
         question = str(text or "")
         if url:
-            # Remove both raw URL and markdown link forms that point to it.
             question = question.replace(url, " ", 1)
             question = re.sub(r"\[[^\]]*\]\(\s*" + re.escape(url) + r"\s*\)", " ", question)
         question = re.sub(r"\[[^\]]*\]\(\s*\)", " ", question)
         question = re.sub(r"\s+", " ", question).strip(" +，,。")
         return question, self._normalize_bilibili_url(url)
+
+    @staticmethod
+    def _is_youtube_url(url: str) -> bool:
+        try:
+            from urllib.parse import urlsplit
+            host = urlsplit(url).netloc.lower()
+        except Exception:
+            return False
+        return "youtube.com" in host or "youtu.be" in host
 
     @staticmethod
     def _escape(text: str) -> str:
@@ -622,6 +522,49 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
         lowered = text.lower()
         return "safe=false" in lowered or "safe: false" in lowered or "不适合总结" in text or "已停止" in text
 
+    @staticmethod
+    def _mask_secret(value: str) -> str:
+        value = str(value or "")
+        if not value:
+            return "<empty>"
+        if len(value) <= 8:
+            return value[:2] + "***"
+        return value[:4] + "..." + value[-4:]
+
+    @staticmethod
+    def _short_error(exc: BaseException, limit: int = 240) -> str:
+        text = str(exc) or type(exc).__name__
+        text = re.sub(r"[A-Za-z0-9_\-]{24,}", lambda m: m.group(0)[:6] + "..." + m.group(0)[-4:], text)
+        return f"{type(exc).__name__}: {text[:limit]}"
+
+    async def _probe_openrouter_text(self, event: AstrMessageEvent) -> str:
+        try:
+            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
+            messages = [{"role": "user", "content": "请只回复 PONG"}]
+            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
+            return f"OK：model={model} key={self._mask_secret(api_key)} base={base_url} resp={text[:80] or '<empty>'}"
+        except Exception as exc:
+            return "FAIL：" + self._short_error(exc)
+
+    async def _probe_openrouter_video_url(self, event: AstrMessageEvent, url: str) -> str:
+        if not url:
+            return "SKIP：未提供 URL"
+        try:
+            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "请用中文用一句话描述这个视频。"},
+                        {"type": "video_url", "video_url": {"url": url}},
+                    ],
+                }
+            ]
+            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
+            return f"OK：{text[:160] or '<empty>'}"
+        except Exception as exc:
+            return "FAIL：" + self._short_error(exc)
+
     @filter.command("视频分析")
     async def video_analyze(self, event: AstrMessageEvent, text: GreedyStr):
         """分析一个视频 URL。用法：/视频分析 你的问题 https://..."""
@@ -660,22 +603,13 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                     yield event.plain_result(f"视频时长 {duration/60:.1f} 分钟，超过上限 {self.max_duration_minutes:.1f} 分钟。")
                     return
 
-                backend = self._select_backend()
                 downloaded_info = info
-                if backend == "openrouter_video" and self.openrouter_youtube_direct_url and self._is_youtube_url(url):
-                    analysis, used = await self._analyze_with_openrouter(
-                        event, url, None, question, user_id
-                    )
+                if self.youtube_direct_url and self._is_youtube_url(url):
+                    analysis, used = await self._analyze_with_openrouter(event, url, None, question, user_id)
                 else:
                     video_path, downloaded_info = await self._download_video(url, task_id)
-                    if backend == "openrouter_video":
-                        analysis, used = await self._analyze_with_openrouter(
-                            event, url, video_path, question, user_id
-                        )
-                    else:
-                        analysis, used = await self._analyze_with_gemini(
-                            event, video_path, question, user_id
-                        )
+                    analysis, used = await self._analyze_with_openrouter(event, url, video_path, question, user_id)
+
                 title = str(downloaded_info.get("title") or info.get("title") or self.card_title)
                 image = await self._render_card(title, analysis, url, safe=not self._looks_refusal(analysis))
                 yield event.image_result(image)
@@ -684,133 +618,17 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                 logger.exception("[VideoSummary] failed")
                 yield event.plain_result(f"视频分析失败：{type(exc).__name__}: {exc}")
             finally:
-                if video_path:
-                    prefix = video_path.name.split("_", 1)[0]
                 for path in self.temp_dir.glob(f"{task_id}_*"):
                     try:
                         path.unlink()
                     except OSError:
                         pass
 
-    @staticmethod
-    def _mask_secret(value: str) -> str:
-        value = str(value or "")
-        if not value:
-            return "<empty>"
-        if len(value) <= 8:
-            return value[:2] + "***"
-        return value[:4] + "..." + value[-4:]
-
-    @staticmethod
-    def _short_error(exc: BaseException, limit: int = 240) -> str:
-        text = str(exc) or type(exc).__name__
-        text = re.sub(r"[A-Za-z0-9_\-]{24,}", lambda m: m.group(0)[:6] + "..." + m.group(0)[-4:], text)
-        return f"{type(exc).__name__}: {text[:limit]}"
-
-    def _make_silent_wav(self) -> Path:
-        path = self.temp_dir / f"stt_probe_{int(time.time() * 1000)}.wav"
-        with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(b"\x00\x00" * 16000)
-        return path
-
-    async def _probe_openai_stt(self) -> str:
-        if not self.stt_enabled:
-            return "SKIP：stt.enabled=false"
-        if not self.stt_api_base_url or not self.stt_api_key:
-            return "SKIP：stt.api_base_url 或 stt.api_key 未配置"
-        wav = self._make_silent_wav()
-        try:
-            form = aiohttp.FormData()
-            form.add_field("model", self.stt_model)
-            form.add_field(
-                "file",
-                wav.read_bytes(),
-                filename="stt_probe.wav",
-                content_type="audio/wav",
-            )
-            timeout = aiohttp.ClientTimeout(total=45, connect=10)
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-                async with session.post(
-                    f"{self.stt_api_base_url}/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {self.stt_api_key}"},
-                    data=form,
-                ) as resp:
-                    body = await resp.text()
-                    if resp.status < 400:
-                        return f"OK：HTTP {resp.status}，返回 {body[:120]}"
-                    return f"FAIL：HTTP {resp.status}，返回 {body[:180]}"
-        finally:
-            try:
-                wav.unlink()
-            except OSError:
-                pass
-
-    async def _probe_gemini_text(self, client, model: str) -> str:
-        try:
-            resp = await asyncio.to_thread(
-                client.models.generate_content,
-                model=model,
-                contents="请只回复 PONG",
-            )
-            text = str(getattr(resp, "text", "") or "").strip()
-            return f"OK：{text[:80] or '<empty>'}"
-        except Exception as exc:
-            return "FAIL：" + self._short_error(exc)
-
-    async def _probe_gemini_file_api(self, client) -> str:
-        probe = self.temp_dir / f"gemini_file_probe_{int(time.time() * 1000)}.txt"
-        probe.write_text("hello", encoding="utf-8")
-        try:
-            uploaded = await self._upload_and_wait_file(client, probe)
-            name = str(getattr(uploaded, "name", "") or "")
-            uri = str(getattr(uploaded, "uri", "") or "")
-            return f"OK：name={name or '<none>'} uri={uri[:48] or '<none>'}"
-        except Exception as exc:
-            return "FAIL：" + self._short_error(exc)
-        finally:
-            try:
-                probe.unlink()
-            except OSError:
-                pass
-
-    async def _probe_openrouter_text(self, event: AstrMessageEvent) -> str:
-        try:
-            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
-            messages = [{"role": "user", "content": "请只回复 PONG"}]
-            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
-            return f"OK：model={model} key={self._mask_secret(api_key)} base={base_url} resp={text[:80] or '<empty>'}"
-        except Exception as exc:
-            return "FAIL：" + self._short_error(exc)
-
-    async def _probe_openrouter_video_url(self, event: AstrMessageEvent, url: str) -> str:
-        if not url:
-            return "SKIP：未提供 URL"
-        if not self._is_youtube_url(url):
-            return "SKIP：非 YouTube URL；OpenRouter 直接 URL 支持取决于模型/Provider，非 YouTube 通常需下载后 base64。"
-        try:
-            api_key, base_url, model, timeout, custom_headers = await self._resolve_openrouter_config(event)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "请用中文用一句话描述这个视频。"},
-                        {"type": "video_url", "video_url": {"url": url}},
-                    ],
-                }
-            ]
-            text = await self._openrouter_chat(api_key, base_url, model, timeout, messages, custom_headers)
-            return f"OK：{text[:160] or '<empty>'}"
-        except Exception as exc:
-            return "FAIL：" + self._short_error(exc)
-
     @filter.command("视频分析自检")
     async def diagnostics(self, event: AstrMessageEvent, text: GreedyStr = ""):
-        """自检 Gemini Files API、字幕信息、STT 中转站等链路。"""
+        """自检 OpenRouter Omni、yt-dlp 和配置。"""
         event.stop_event()
-        lines: list[str] = ["🧪 视频分析插件自检"]
+        lines: list[str] = ["🧪 视频分析插件自检（OpenRouter Omni 专精）"]
         raw = str(text or "")
         _question, url = self._split_question_and_url(raw)
         if not url:
@@ -819,26 +637,8 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
             except Exception:
                 pass
         lines.append(f"URL：{url or '未提供'}")
-
-        if self.backend_mode in {"gemini", "gemini_files"} or self.provider_id:
-            try:
-                api_key, model, api_base, timeout = await self._resolve_gemini_provider(event)
-                lines.append(f"Gemini Provider：OK model={model} key={self._mask_secret(api_key)}")
-                lines.append(f"Gemini api_base：{api_base or 'Google 官方默认'} timeout={timeout}s")
-                client = genai.Client(api_key=api_key, http_options=types.HttpOptions(base_url=api_base, timeout=timeout * 1000))
-                lines.append("Gemini 文本生成：" + await self._probe_gemini_text(client, model))
-                lines.append("Gemini Files API：" + await self._probe_gemini_file_api(client))
-            except Exception as exc:
-                lines.append("Gemini Provider：FAIL " + self._short_error(exc))
-        else:
-            lines.append("Gemini：SKIP：当前后端为 OpenRouter，未配置 gemini.provider_id")
-
-        if self._has_openrouter_config():
-            lines.append("OpenRouter 文本：" + await self._probe_openrouter_text(event))
-            lines.append("OpenRouter 视频URL：" + await self._probe_openrouter_video_url(event, url))
-        else:
-            lines.append("OpenRouter：SKIP：未配置 openrouter.api_key 或 openrouter.provider_id")
-
+        lines.append("OpenRouter 文本：" + await self._probe_openrouter_text(event))
+        lines.append("OpenRouter 视频URL：" + await self._probe_openrouter_video_url(event, url))
         if url:
             try:
                 info = await self._extract_info(url)
@@ -856,8 +656,6 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                     lines.append("限制：OK 时长未超限或未知")
             except Exception as exc:
                 lines.append("yt-dlp 元信息：FAIL " + self._short_error(exc))
-
-        lines.append("OpenAI 兼容 STT：" + await self._probe_openai_stt())
         yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
