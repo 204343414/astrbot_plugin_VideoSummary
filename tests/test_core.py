@@ -217,6 +217,28 @@ class VideoSummaryCoreTests(unittest.TestCase):
         self.assertTrue(ctype.startswith("multipart/form-data; boundary=----VideoSummary"))
 
 
+
+    def test_download_opts_enable_retries_and_chunking(self):
+        # yt-dlp 默认 retries=None -> RetryManager 解析为 0 次重试。
+        from yt_dlp.utils import RetryManager
+        self.assertEqual(RetryManager(None, lambda **k: None).retries, 0)
+        plugin = self.mod.VideoSummaryPlugin.__new__(self.mod.VideoSummaryPlugin)
+        plugin.download_retries = 10
+        plugin.bilibili_cookies = plugin.douyin_cookies = ""
+        plugin.youtube_cookies = plugin.generic_cookies = ""
+        plugin.data_dir = Path(tempfile.mkdtemp())
+        plugin.cookie_dir = plugin.data_dir / "cookies"
+        plugin.cookie_dir.mkdir(parents=True, exist_ok=True)
+        opts = plugin._ydl_opts("https://www.youtube.com/watch?v=x", download=True, outtmpl="/tmp/o.%(ext)s")
+        self.assertEqual(opts["retries"], 10)
+        self.assertEqual(opts["fragment_retries"], 10)
+        self.assertTrue(opts["continuedl"])
+        self.assertEqual(opts["http_chunk_size"], 5 * 1024 * 1024)
+        meta = plugin._ydl_opts("https://www.youtube.com/watch?v=x", download=False)
+        self.assertTrue(meta["skip_download"])
+        self.assertNotIn("http_chunk_size", meta)
+
+
 if __name__ == "__main__":
     unittest.main()
 

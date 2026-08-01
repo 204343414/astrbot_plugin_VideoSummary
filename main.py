@@ -54,7 +54,7 @@ DASHSCOPE_UPLOAD_ENDPOINTS = {
     PLUGIN_NAME,
     "204343414",
     "Qwen 视频内容分析与安全摘要",
-    "0.7.2",
+    "0.7.3",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -77,6 +77,7 @@ class VideoSummaryPlugin(Star):
         )
         self.daily_limit_per_user = max(int(limits.get("daily_limit_per_user", 3)), 0)
         self.max_concurrent_jobs = max(int(limits.get("max_concurrent_jobs", 1)), 1)
+        self.download_retries = max(int(limits.get("download_retries", 10) or 10), 1)
         self._semaphore = asyncio.Semaphore(self.max_concurrent_jobs)
 
         access = config.get("access_control", {}) or {}
@@ -387,6 +388,15 @@ class VideoSummaryPlugin(Star):
                     "format": format_selector or self._download_format_selectors()[0],
                     "merge_output_format": "mp4",
                     "format_sort": ["+res", "vcodec:avc", "ext:mp4:m4a"],
+                    # yt-dlp 默认 retries=None，RetryManager 会解析成 0 次重试：
+                    # 跨境链路一次断流就直接 "N bytes read, M more expected" 报错。
+                    "retries": self.download_retries,
+                    "fragment_retries": self.download_retries,
+                    "extractor_retries": 3,
+                    "socket_timeout": 30,
+                    "continuedl": True,
+                    # 分块拉取，单块失败可重试，避免长连接被中途掐断。
+                    "http_chunk_size": 5 * 1024 * 1024,
                 }
             )
         else:
@@ -861,11 +871,17 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
         except Exception as exc:
             return "FAIL：" + self._short_error(exc)
 
-    async def _probe_video(self, event: AstrMessageEvent, url: str, direct: bool, local_mode: str = "auto") -> str:
+    async def _probe_video(
+        self,
+        event: AstrMessageEvent,
+        url: str,
+        direct: bool,
+        local_mode: str = "auto",
+        cached: dict | None = None,
+    ) -> str:
+        """cached: 跨探针共享的下载结果，避免同一视频被重复下载三次。"""
         if not url:
             return "SKIP：未提供 URL"
-        task_id = f"diag_{int(time.time() * 1000)}"
-        video_path = None
         try:
             if direct:
                 info = await self._extract_info(url)
@@ -875,7 +891,18 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                 text, _ = await self._analyze_with_qwen(event, media_url, None, "请用中文用一句话描述这个视频。", "__diag__")
                 self.usage.get("users", {}).pop("__diag__", None); self._save_usage()
                 return f"OK：format={fmt.get('format_id')} resp={text[:160] or '<empty>'}"
-            video_path, _info = await self._download_video(url, task_id)
+
+            store = cached if cached is not None else {}
+            if "error" in store:
+                return "FAIL：（复用上一次下载结果）" + store["error"]
+            if "path" not in store:
+                try:
+                    path, _info = await self._download_video(url, store.setdefault("task_id", f"diag_{int(time.time() * 1000)}"))
+                    store["path"] = path
+                except Exception as exc:
+                    store["error"] = self._short_error(exc)
+                    return "FAIL：" + store["error"]
+            video_path = store["path"]
             size_mb = video_path.stat().st_size / 1024 / 1024
             if local_mode == "base64" and video_path.stat().st_size > QWEN_RAW_BASE64_SAFE_BYTES:
                 return f"SKIP：本地文件 {size_mb:.1f}MB 超过 base64 安全上限 {QWEN_RAW_BASE64_SAFE_BYTES/1024/1024:.1f}MB"
@@ -887,10 +914,6 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
         except Exception as exc:
             self.usage.get("users", {}).pop("__diag__", None); self._save_usage()
             return "FAIL：" + self._short_error(exc)
-        finally:
-            for path in self.temp_dir.glob(f"{task_id}_*"):
-                try: path.unlink()
-                except OSError: pass
 
     @filter.command("视频分析")
     async def video_analyze(self, event: AstrMessageEvent, text: GreedyStr):
@@ -958,12 +981,20 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
             except Exception: pass
         lines.append(f"URL：{url or '未提供'}")
         lines.append("Qwen 文本：" + await self._probe_qwen_text(event))
-        lines.append("Qwen 直接视频URL：" + await self._probe_video(event, url, direct=True))
-        lines.append("Qwen 下载后临时OSS：" + (
-            await self._probe_video(event, url, direct=False, local_mode="oss")
-            if self.use_temp_oss_upload else "SKIP：qwen.use_temp_oss_upload=false"
-        ))
-        lines.append("Qwen 下载后base64：" + await self._probe_video(event, url, direct=False, local_mode="base64"))
+        cached: dict = {}
+        try:
+            lines.append("Qwen 直接视频URL：" + await self._probe_video(event, url, direct=True))
+            lines.append("Qwen 下载后临时OSS：" + (
+                await self._probe_video(event, url, direct=False, local_mode="oss", cached=cached)
+                if self.use_temp_oss_upload else "SKIP：qwen.use_temp_oss_upload=false"
+            ))
+            lines.append("Qwen 下载后base64：" + await self._probe_video(event, url, direct=False, local_mode="base64", cached=cached))
+        finally:
+            task_id = cached.get("task_id")
+            if task_id:
+                for path in self.temp_dir.glob(f"{task_id}_*"):
+                    try: path.unlink()
+                    except OSError: pass
         lines.append(
             f"百炼上限：base64 编码后 <10MB（原始 ≤{QWEN_RAW_BASE64_SAFE_BYTES/1024/1024:.1f}MB）；"
             f"URL 方式 Qwen3.5-Omni ≤2GB/1小时。临时OSS端点={self._dashscope_upload_url(self.qwen_base_url)}"

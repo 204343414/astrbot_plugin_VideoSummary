@@ -61,7 +61,10 @@
 
 - `limits.max_duration_minutes`：最大视频分钟数，默认 60，且会被硬性收敛到官方上限 60；
 - `limits.daily_limit_per_user`：每人每日次数；
-- `limits.max_concurrent_jobs`：最大并发任务数。
+- `limits.max_concurrent_jobs`：最大并发任务数；
+- `limits.download_retries`：yt-dlp 下载重试次数，默认 10。yt-dlp 默认**不重试**，跨境链路一次断流就会报 `N bytes read, M more expected`；插件同时启用 5MB 分块拉取与断点续传。
+
+自检的三个探针共享同一次下载，不会重复下载三遍。
 
 ## 自检
 

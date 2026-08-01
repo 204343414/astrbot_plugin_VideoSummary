@@ -95,6 +95,12 @@
         "description": "最大并发分析任务数",
         "type": "int",
         "default": 1
+      },
+      "download_retries": {
+        "description": "yt-dlp 下载重试次数",
+        "type": "int",
+        "default": 10,
+        "hint": "yt-dlp 默认不重试，跨境链路一次断流就报 \"N bytes read, M more expected\"。同时启用 5MB 分块拉取与断点续传。"
       }
     }
   },
