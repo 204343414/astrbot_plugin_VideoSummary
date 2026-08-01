@@ -188,6 +188,35 @@ class VideoSummaryCoreTests(unittest.TestCase):
         self.assertEqual(coerce(None), "")
 
 
+
+    def test_streamed_multipart_matches_monolithic_and_length(self):
+        import asyncio, os, tempfile
+        from pathlib import Path as P
+        cls = self.mod.VideoSummaryPlugin
+        fields = [("OSSAccessKeyId", "AK"), ("key", "d/a.mp4"), ("success_action_status", "200")]
+        payload = os.urandom(3 * 1024 * 1024 + 17)
+        f = P(tempfile.mkdtemp()) / "a.mp4"
+        f.write_bytes(payload)
+        prefix, suffix, ctype = cls._oss_multipart_parts(fields, "a.mp4")
+        total = len(prefix) + f.stat().st_size + len(suffix)
+
+        async def collect():
+            out = [prefix]
+            with f.open("rb") as h:
+                while True:
+                    b = h.read(1024 * 1024)
+                    if not b:
+                        break
+                    out.append(b)
+            out.append(suffix)
+            return b"".join(out)
+
+        streamed = asyncio.run(collect())
+        self.assertEqual(len(streamed), total)
+        self.assertEqual(streamed, prefix + payload + suffix)
+        self.assertTrue(ctype.startswith("multipart/form-data; boundary=----VideoSummary"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -51,6 +51,8 @@
 | 公网 URL（Qwen3-Omni-Flash） | 256MB，时长 150 秒 |
 | 公网 URL（Qwen-Omni-Turbo） | 150MB，时长 40 秒 |
 
+上传采用流式分块读盘（1MB/块）并显式声明 `Content-Length`，不会把整个视频读进内存。
+
 已知坑：OSS PostObject 的表单体必须手工拼装——`aiohttp.FormData` 会给文本字段补 `Content-Type: text/plain` 并把它排在 `Content-Disposition` 之前，OSS 会返回 `400 MalformedPOSTRequest`。同理 `filename` 必须是 ASCII，`file` 字段必须放最后。
 
 临时存储空间注意事项：`getPolicy` 时的 `model` 必须与推理所用 `model` 完全一致；上传与推理的 API Key 需属于同一阿里云主账号；`getPolicy` 接口有限流。

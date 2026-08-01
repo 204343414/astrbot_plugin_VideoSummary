@@ -54,7 +54,7 @@ DASHSCOPE_UPLOAD_ENDPOINTS = {
     PLUGIN_NAME,
     "204343414",
     "Qwen 视频内容分析与安全摘要",
-    "0.7.1",
+    "0.7.2",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -534,11 +534,24 @@ class VideoSummaryPlugin(Star):
                 ("x-oss-forbid-overwrite", str(policy.get("x_oss_forbid_overwrite", "true"))),
                 ("success_action_status", "200"),
             ]
-            body, content_type = self._build_oss_multipart(fields, safe_name, video_path.read_bytes())
+            prefix, suffix, content_type = self._oss_multipart_parts(fields, safe_name)
+            total = len(prefix) + video_path.stat().st_size + len(suffix)
+
+            async def stream_body():
+                # 逐块读盘，避免把整个视频（最大可达 2GB）读进内存再拷贝一次。
+                yield prefix
+                with video_path.open("rb") as handle:
+                    while True:
+                        block = handle.read(1024 * 1024)
+                        if not block:
+                            break
+                        yield block
+                yield suffix
+
             async with session.post(
                 str(policy["upload_host"]),
-                data=body,
-                headers={"Content-Type": content_type, "Content-Length": str(len(body))},
+                data=stream_body(),
+                headers={"Content-Type": content_type, "Content-Length": str(total)},
             ) as resp:
                 if resp.status not in (200, 204):
                     raise RuntimeError(f"OSS 上传 HTTP {resp.status}: {(await resp.text())[:300]}")
@@ -554,12 +567,13 @@ class VideoSummaryPlugin(Star):
         return f"{cleaned or 'video'}.{ext}"
 
     @staticmethod
-    def _build_oss_multipart(fields: list[tuple[str, str]], filename: str, payload: bytes) -> tuple[bytes, str]:
-        """手工拼装 multipart/form-data。
+    def _oss_multipart_parts(fields: list[tuple[str, str]], filename: str) -> tuple[bytes, bytes, str]:
+        """手工拼装 multipart/form-data 的前后缀，文件内容由调用方流式塞在中间。
 
         不能用 aiohttp.FormData：它会给每个文本字段补 ``Content-Type: text/plain``，
         并把 ``Content-Type`` 排在 ``Content-Disposition`` 之前，OSS PostObject
-        解析器对此会返回 400 MalformedPOSTRequest。file 字段必须排在最后。
+        解析器对此会返回 400 MalformedPOSTRequest。file 字段必须排在最后，
+        boundary 不能加引号。
         """
         boundary = f"----VideoSummary{os.urandom(12).hex()}"
         chunks: list[bytes] = []
@@ -572,9 +586,14 @@ class VideoSummaryPlugin(Star):
             f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
         )
         chunks.append(b"Content-Type: application/octet-stream\r\n\r\n")
-        chunks.append(payload)
-        chunks.append(f"\r\n--{boundary}--\r\n".encode())
-        return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+        prefix = b"".join(chunks)
+        suffix = f"\r\n--{boundary}--\r\n".encode()
+        return prefix, suffix, f"multipart/form-data; boundary={boundary}"
+
+    @classmethod
+    def _build_oss_multipart(cls, fields: list[tuple[str, str]], filename: str, payload: bytes) -> tuple[bytes, str]:
+        prefix, suffix, content_type = cls._oss_multipart_parts(fields, filename)
+        return prefix + payload + suffix, content_type
 
     async def _resolve_qwen_config(self, event: AstrMessageEvent) -> tuple[str, str, str, int, dict]:
         provider = None
@@ -849,9 +868,13 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
         video_path = None
         try:
             if direct:
-                text, _ = await self._analyze_with_qwen(event, url, None, "请用中文用一句话描述这个视频。", "__diag__")
+                info = await self._extract_info(url)
+                media_url, fmt = self._select_progressive_media_url(info)
+                if not media_url:
+                    return "SKIP：该站点无音画合一直链，本就应走下载路径"
+                text, _ = await self._analyze_with_qwen(event, media_url, None, "请用中文用一句话描述这个视频。", "__diag__")
                 self.usage.get("users", {}).pop("__diag__", None); self._save_usage()
-                return f"OK：{text[:160] or '<empty>'}"
+                return f"OK：format={fmt.get('format_id')} resp={text[:160] or '<empty>'}"
             video_path, _info = await self._download_video(url, task_id)
             size_mb = video_path.stat().st_size / 1024 / 1024
             if local_mode == "base64" and video_path.stat().st_size > QWEN_RAW_BASE64_SAFE_BYTES:
