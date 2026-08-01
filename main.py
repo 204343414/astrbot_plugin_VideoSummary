@@ -54,7 +54,7 @@ DASHSCOPE_UPLOAD_ENDPOINTS = {
     PLUGIN_NAME,
     "204343414",
     "Qwen 视频内容分析与安全摘要",
-    "0.7.0",
+    "0.7.1",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -104,6 +104,7 @@ class VideoSummaryPlugin(Star):
         self.qwen_base64_prefix = str(qwen.get("base64_prefix", "data:;base64,") or "data:;base64,")
         self.try_direct_media_url = bool(qwen.get("try_direct_media_url", True))
         self.use_temp_oss_upload = bool(qwen.get("use_temp_oss_upload", True))
+        self.qwen_video_timeout_seconds = max(int(qwen.get("video_timeout_seconds", 300) or 300), 60)
         self.temp_oss_endpoint = str(qwen.get("temp_oss_endpoint", "auto") or "auto").strip().lower()
 
         cookies = config.get("cookies", {}) or {}
@@ -522,21 +523,58 @@ class VideoSummaryPlugin(Star):
             if missing:
                 raise RuntimeError(f"getPolicy 返回缺少字段: {missing}")
 
-            key = f"{str(policy['upload_dir']).rstrip('/')}/{video_path.name}"
-            form = aiohttp.FormData()
-            form.add_field("OSSAccessKeyId", str(policy["oss_access_key_id"]))
-            form.add_field("Signature", str(policy["signature"]))
-            form.add_field("policy", str(policy["policy"]))
-            form.add_field("x-oss-object-acl", str(policy.get("x_oss_object_acl", "private")))
-            form.add_field("x-oss-forbid-overwrite", str(policy.get("x_oss_forbid_overwrite", "true")))
-            form.add_field("key", key)
-            form.add_field("success_action_status", "200")
-            with video_path.open("rb") as handle:
-                form.add_field("file", handle, filename=video_path.name, content_type="application/octet-stream")
-                async with session.post(str(policy["upload_host"]), data=form) as resp:
-                    if resp.status not in (200, 204):
-                        raise RuntimeError(f"OSS 上传 HTTP {resp.status}: {(await resp.text())[:300]}")
+            safe_name = self._oss_safe_filename(video_path.name)
+            key = f"{str(policy['upload_dir']).rstrip('/')}/{safe_name}"
+            fields = [
+                ("OSSAccessKeyId", str(policy["oss_access_key_id"])),
+                ("policy", str(policy["policy"])),
+                ("Signature", str(policy["signature"])),
+                ("key", key),
+                ("x-oss-object-acl", str(policy.get("x_oss_object_acl", "private"))),
+                ("x-oss-forbid-overwrite", str(policy.get("x_oss_forbid_overwrite", "true"))),
+                ("success_action_status", "200"),
+            ]
+            body, content_type = self._build_oss_multipart(fields, safe_name, video_path.read_bytes())
+            async with session.post(
+                str(policy["upload_host"]),
+                data=body,
+                headers={"Content-Type": content_type, "Content-Length": str(len(body))},
+            ) as resp:
+                if resp.status not in (200, 204):
+                    raise RuntimeError(f"OSS 上传 HTTP {resp.status}: {(await resp.text())[:300]}")
         return f"oss://{key}"
+
+    @staticmethod
+    def _oss_safe_filename(name: str) -> str:
+        """OSS PostObject 的 filename 需为 ASCII，非 ASCII 文件名会导致 MalformedPOSTRequest。"""
+        stem, dot, ext = name.rpartition(".")
+        ext = (ext if dot else "mp4").lower()
+        ext = re.sub(r"[^A-Za-z0-9]", "", ext) or "mp4"
+        cleaned = re.sub(r"[^A-Za-z0-9_\-]", "", (stem if dot else name))
+        return f"{cleaned or 'video'}.{ext}"
+
+    @staticmethod
+    def _build_oss_multipart(fields: list[tuple[str, str]], filename: str, payload: bytes) -> tuple[bytes, str]:
+        """手工拼装 multipart/form-data。
+
+        不能用 aiohttp.FormData：它会给每个文本字段补 ``Content-Type: text/plain``，
+        并把 ``Content-Type`` 排在 ``Content-Disposition`` 之前，OSS PostObject
+        解析器对此会返回 400 MalformedPOSTRequest。file 字段必须排在最后。
+        """
+        boundary = f"----VideoSummary{os.urandom(12).hex()}"
+        chunks: list[bytes] = []
+        for name, value in fields:
+            chunks.append(f"--{boundary}\r\n".encode())
+            chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            chunks.append(f"{value}\r\n".encode())
+        chunks.append(f"--{boundary}\r\n".encode())
+        chunks.append(
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+        )
+        chunks.append(b"Content-Type: application/octet-stream\r\n\r\n")
+        chunks.append(payload)
+        chunks.append(f"\r\n--{boundary}--\r\n".encode())
+        return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
     async def _resolve_qwen_config(self, event: AstrMessageEvent) -> tuple[str, str, str, int, dict]:
         provider = None
@@ -595,7 +633,11 @@ class VideoSummaryPlugin(Star):
                         msg = raw
                     raise RuntimeError(f"Qwen HTTP {resp.status}: {str(msg)[:300]}")
                 if self.qwen_stream:
-                    parts = []
+                    parts: list[str] = []
+                    reasoning_parts: list[str] = []
+                    finish_reason = ""
+                    stream_error = ""
+                    saw_chunk = False
                     for line in raw.splitlines():
                         line = line.strip()
                         if not line.startswith("data:"):
@@ -607,18 +649,64 @@ class VideoSummaryPlugin(Star):
                             chunk = json.loads(payload_text)
                         except Exception:
                             continue
-                        choices = chunk.get("choices") or []
-                        if choices:
-                            content = choices[0].get("delta", {}).get("content")
-                            if isinstance(content, str):
-                                parts.append(content)
-                    return "".join(parts).strip()
+                        saw_chunk = True
+                        if isinstance(chunk.get("error"), dict):
+                            stream_error = str(chunk["error"].get("message") or chunk["error"])
+                        for choice in chunk.get("choices") or []:
+                            if choice.get("finish_reason"):
+                                finish_reason = str(choice["finish_reason"])
+                            delta = choice.get("delta") or choice.get("message") or {}
+                            parts.append(self._coerce_content_text(delta.get("content")))
+                            reasoning_parts.append(self._coerce_content_text(delta.get("reasoning_content")))
+                    text = "".join(parts).strip()
+                    if text:
+                        return text
+                    if stream_error:
+                        raise RuntimeError(f"Qwen 流式返回错误：{stream_error[:300]}")
+                    reasoning = "".join(reasoning_parts).strip()
+                    if reasoning:
+                        # 只吐了思考没吐正文，多见于 omni 思考模式；把思考内容当结果总比空手而归好。
+                        logger.warning("[VideoSummary] Qwen returned reasoning_content only")
+                        return reasoning
+                    if not saw_chunk:
+                        raise RuntimeError(f"Qwen 流式响应无有效分片，原始响应：{raw[:300] or '<empty>'}")
+                    raise RuntimeError(
+                        f"Qwen 流式响应未含文本，finish_reason={finish_reason or '未知'}，原始响应：{raw[:300]}"
+                    )
                 data = json.loads(raw)
                 choices = data.get("choices") or []
                 if not choices:
                     raise RuntimeError(f"Qwen 未返回 choices: {str(data)[:300]}")
-                content = choices[0].get("message", {}).get("content", "")
-                return content.strip() if isinstance(content, str) else str(content).strip()
+                message = choices[0].get("message") or {}
+                content = self._coerce_content_text(message.get("content")).strip()
+                if not content:
+                    content = self._coerce_content_text(message.get("reasoning_content")).strip()
+                if not content:
+                    raise RuntimeError(
+                        f"Qwen 返回空文本，finish_reason={choices[0].get('finish_reason') or '未知'}，"
+                        f"原始响应：{raw[:300]}"
+                    )
+                return content
+
+    @staticmethod
+    def _coerce_content_text(content) -> str:
+        """OpenAI 兼容响应的 content 可能是 str，也可能是 [{'type':'text','text':...}]。"""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            out = []
+            for item in content:
+                if isinstance(item, str):
+                    out.append(item)
+                elif isinstance(item, dict):
+                    value = item.get("text") or item.get("content") or ""
+                    if isinstance(value, str):
+                        out.append(value)
+            return "".join(out)
+        if isinstance(content, dict):
+            value = content.get("text") or content.get("content") or ""
+            return value if isinstance(value, str) else ""
+        return ""
 
     async def _analyze_with_qwen(
         self,
@@ -631,6 +719,8 @@ class VideoSummaryPlugin(Star):
     ) -> tuple[str, int]:
         """local_mode: auto=先临时OSS后base64；oss=只走临时OSS；base64=只走base64。"""
         api_key, base_url, model, timeout, custom_headers = await self._resolve_qwen_config(event)
+        # 视频请求服务端要拉流+抽帧，比纯文本慢得多，单独放宽超时。
+        timeout = max(timeout, self.qwen_video_timeout_seconds)
         prompt = self._build_prompt(user_question)
 
         async def call(video_ref: str, oss_resolve: bool) -> str:

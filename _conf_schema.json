@@ -67,6 +67,12 @@
           "intl"
         ],
         "hint": "auto 按 base_url 主机名判断；cn=dashscope.aliyuncs.com；intl=dashscope-intl.aliyuncs.com。上传与推理必须同一主账号。"
+      },
+      "video_timeout_seconds": {
+        "description": "视频请求超时（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "视频请求服务端需拉流+抽帧，远慢于纯文本。直链不可达时会一直挂到超时，最低 60。"
       }
     }
   },

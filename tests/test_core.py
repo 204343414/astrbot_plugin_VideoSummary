@@ -158,6 +158,36 @@ class VideoSummaryCoreTests(unittest.TestCase):
         self.assertEqual(self.mod.QWEN_MAX_DURATION_MINUTES, 60.0)
 
 
+
+    def test_oss_multipart_puts_disposition_before_content_type(self):
+        # 查档：OSS PostObject 要求 Content-Type 在 Content-Disposition 之后，
+        # 且文本字段不得带 Content-Type，否则 400 MalformedPOSTRequest。
+        body, ctype = self.mod.VideoSummaryPlugin._build_oss_multipart(
+            [("OSSAccessKeyId", "AK"), ("key", "dir/a.mp4")], "a.mp4", b"BIN"
+        )
+        self.assertTrue(ctype.startswith("multipart/form-data; boundary="))
+        self.assertNotIn('"', ctype)
+        text = body.decode("latin-1")
+        self.assertNotIn("text/plain", text)
+        self.assertLess(text.index("Content-Disposition"), text.index("Content-Type"))
+        self.assertIn('name="file"; filename="a.mp4"', text)
+        self.assertGreater(text.index('name="file"'), text.index('name="key"'))
+        self.assertTrue(text.rstrip().endswith("--"))
+
+    def test_oss_safe_filename_strips_non_ascii(self):
+        safe = self.mod.VideoSummaryPlugin._oss_safe_filename
+        self.assertEqual(safe("1234_影流之主.mp4"), "1234_.mp4")
+        self.assertEqual(safe("纯中文.webm"), "video.webm")
+        self.assertEqual(safe("noext"), "noext.mp4")
+
+    def test_coerce_content_text_handles_list_and_dict(self):
+        coerce = self.mod.VideoSummaryPlugin._coerce_content_text
+        self.assertEqual(coerce("hi"), "hi")
+        self.assertEqual(coerce([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]), "ab")
+        self.assertEqual(coerce({"text": "x"}), "x")
+        self.assertEqual(coerce(None), "")
+
+
 if __name__ == "__main__":
     unittest.main()
 
