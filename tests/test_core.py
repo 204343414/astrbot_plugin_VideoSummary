@@ -124,5 +124,40 @@ class VideoSummaryCoreTests(unittest.TestCase):
         self.assertEqual(fmt["height"], 144)
 
 
+    def test_base64_limit_matches_dashscope_10mb(self):
+        # 查档：百炼多模态本地文件 Base64 编码后必须 < 10MB
+        self.assertEqual(self.mod.QWEN_BASE64_LIMIT_BYTES, 10 * 1024 * 1024)
+        self.assertLess(self.mod.QWEN_RAW_BASE64_SAFE_BYTES, self.mod.QWEN_BASE64_LIMIT_BYTES * 3 / 4)
+
+    def test_qwen_video_data_url_rejects_oversized_file(self):
+        plugin = self.mod.VideoSummaryPlugin.__new__(self.mod.VideoSummaryPlugin)
+        plugin.qwen_base64_prefix = "data:;base64,"
+        big = Path(tempfile.mkdtemp()) / "big.mp4"
+        with big.open("wb") as handle:
+            handle.write(b"\0" * (self.mod.QWEN_RAW_BASE64_SAFE_BYTES + 1))
+        with self.assertRaises(RuntimeError) as ctx:
+            plugin._qwen_video_data_url(big)
+        self.assertIn("10MB", str(ctx.exception))
+
+    def test_qwen_video_data_url_accepts_small_file(self):
+        plugin = self.mod.VideoSummaryPlugin.__new__(self.mod.VideoSummaryPlugin)
+        plugin.qwen_base64_prefix = "data:;base64,"
+        small = Path(tempfile.mkdtemp()) / "small.mp4"
+        small.write_bytes(b"hello world")
+        self.assertTrue(plugin._qwen_video_data_url(small).startswith("data:;base64,"))
+
+    def test_dashscope_upload_endpoint_selection(self):
+        plugin = self.mod.VideoSummaryPlugin.__new__(self.mod.VideoSummaryPlugin)
+        plugin.temp_oss_endpoint = "auto"
+        self.assertIn("dashscope.aliyuncs.com", plugin._dashscope_upload_url("https://dashscope.aliyuncs.com/compatible-mode/v1"))
+        self.assertIn("dashscope-intl", plugin._dashscope_upload_url("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"))
+        plugin.temp_oss_endpoint = "cn"
+        self.assertIn("//dashscope.aliyuncs.com", plugin._dashscope_upload_url("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"))
+
+    def test_duration_cap_converges_to_official_limit(self):
+        self.assertEqual(self.mod.QWEN_MAX_DURATION_MINUTES, 60.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+

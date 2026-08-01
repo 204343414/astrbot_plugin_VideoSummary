@@ -50,6 +50,23 @@
         "type": "bool",
         "default": true,
         "hint": "开启后先尝试 yt-dlp 解析出的最小音画合一 progressive 媒体直链；失败自动回退下载后 base64。直链可能因 Cookie/Referer/IP 绑定失效。"
+      },
+      "use_temp_oss_upload": {
+        "description": "本地文件走百炼临时存储空间(48小时)",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后本地文件超过约7.5MB时先上传到百炼免费临时OSS拿 oss:// URL 再推理，规避 Base64 10MB 上限；失败自动回退 base64。"
+      },
+      "temp_oss_endpoint": {
+        "description": "临时存储空间地域",
+        "type": "string",
+        "default": "auto",
+        "options": [
+          "auto",
+          "cn",
+          "intl"
+        ],
+        "hint": "auto 按 base_url 主机名判断；cn=dashscope.aliyuncs.com；intl=dashscope-intl.aliyuncs.com。上传与推理必须同一主账号。"
       }
     }
   },
@@ -60,8 +77,8 @@
       "max_duration_minutes": {
         "description": "最大视频时长（分钟）",
         "type": "float",
-        "default": 10,
-        "hint": "只按视频时长限制，不按文件大小限制。"
+        "default": 60,
+        "hint": "只按视频时长限制，不按文件大小限制。Qwen3.5-Omni 官方上限 60 分钟，填更大也会被收敛到 60。"
       },
       "daily_limit_per_user": {
         "description": "每人每日次数，0 表示不限制",

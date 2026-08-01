@@ -15,6 +15,7 @@ import re
 import time
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
 import yt_dlp
@@ -36,12 +37,24 @@ except Exception:  # pragma: no cover
 PLUGIN_NAME = "astrbot_plugin_VideoSummary"
 DEFAULT_QWEN_MODEL = "qwen3.5-omni-flash-2026-03-15"
 
+# 阿里云百炼硬限制（查档：help.aliyun.com/zh/model-studio/error-code 与 /qwen-omni）
+# 本地文件 Base64 编码后必须 < 10MB；Base64 膨胀约 4/3，故原始文件约 7.5MB 封顶。
+QWEN_BASE64_LIMIT_BYTES = 10 * 1024 * 1024
+QWEN_RAW_BASE64_SAFE_BYTES = int(QWEN_BASE64_LIMIT_BYTES * 3 / 4) - 4096
+# 临时存储空间（免费，48 小时有效）
+# Qwen3.5-Omni 官方时长上限：1 小时
+QWEN_MAX_DURATION_MINUTES = 60.0
+DASHSCOPE_UPLOAD_ENDPOINTS = {
+    "cn": "https://dashscope.aliyuncs.com/api/v1/uploads",
+    "intl": "https://dashscope-intl.aliyuncs.com/api/v1/uploads",
+}
+
 
 @register(
     PLUGIN_NAME,
     "204343414",
     "Qwen 视频内容分析与安全摘要",
-    "0.6.0",
+    "0.7.0",
     "https://github.com/204343414/astrbot_plugin_VideoSummary",
 )
 class VideoSummaryPlugin(Star):
@@ -57,7 +70,11 @@ class VideoSummaryPlugin(Star):
         self.usage = self._load_usage()
 
         limits = config.get("limits", {}) or {}
-        self.max_duration_minutes = max(float(limits.get("max_duration_minutes", 10)), 0.1)
+        # 查档：Qwen3.5-Omni 官方时长上限 1 小时，超过再大也无意义，硬性收敛。
+        self.max_duration_minutes = min(
+            max(float(limits.get("max_duration_minutes", QWEN_MAX_DURATION_MINUTES)), 0.1),
+            QWEN_MAX_DURATION_MINUTES,
+        )
         self.daily_limit_per_user = max(int(limits.get("daily_limit_per_user", 3)), 0)
         self.max_concurrent_jobs = max(int(limits.get("max_concurrent_jobs", 1)), 1)
         self._semaphore = asyncio.Semaphore(self.max_concurrent_jobs)
@@ -86,6 +103,8 @@ class VideoSummaryPlugin(Star):
         self.qwen_stream = bool(qwen.get("stream", True))
         self.qwen_base64_prefix = str(qwen.get("base64_prefix", "data:;base64,") or "data:;base64,")
         self.try_direct_media_url = bool(qwen.get("try_direct_media_url", True))
+        self.use_temp_oss_upload = bool(qwen.get("use_temp_oss_upload", True))
+        self.temp_oss_endpoint = str(qwen.get("temp_oss_endpoint", "auto") or "auto").strip().lower()
 
         cookies = config.get("cookies", {}) or {}
         self.bilibili_cookies = str(cookies.get("bilibili", "") or "").strip()
@@ -459,8 +478,65 @@ class VideoSummaryPlugin(Star):
         return candidates[0][4], candidates[0][5]
 
     def _qwen_video_data_url(self, video_path: Path) -> str:
+        raw_size = video_path.stat().st_size
+        if raw_size > QWEN_RAW_BASE64_SAFE_BYTES:
+            raise RuntimeError(
+                f"本地文件 {raw_size/1024/1024:.1f}MB，Base64 编码后会超过百炼 10MB 上限"
+                f"（原始文件需 ≤ {QWEN_RAW_BASE64_SAFE_BYTES/1024/1024:.1f}MB）。"
+            )
         encoded = base64.b64encode(video_path.read_bytes()).decode("ascii")
+        if len(encoded) >= QWEN_BASE64_LIMIT_BYTES:
+            raise RuntimeError(
+                f"Base64 编码后 {len(encoded)/1024/1024:.1f}MB，超过百炼 10MB 上限。"
+            )
         return f"{self.qwen_base64_prefix}{encoded}"
+
+    def _dashscope_upload_url(self, base_url: str) -> str:
+        if self.temp_oss_endpoint in DASHSCOPE_UPLOAD_ENDPOINTS:
+            return DASHSCOPE_UPLOAD_ENDPOINTS[self.temp_oss_endpoint]
+        host = (urlparse(base_url).hostname or "").lower()
+        if "intl" in host or "ap-southeast" in host:
+            return DASHSCOPE_UPLOAD_ENDPOINTS["intl"]
+        return DASHSCOPE_UPLOAD_ENDPOINTS["cn"]
+
+    async def _upload_to_temp_oss(self, api_key: str, base_url: str, model: str, video_path: Path) -> str:
+        """上传本地文件到百炼免费临时存储空间，返回 oss:// 临时 URL（48 小时有效）。
+
+        查档：https://help.aliyun.com/zh/model-studio/get-temporary-file-url
+        注意：getPolicy 的 model 必须与后续推理所用 model 完全一致，且 API Key 需同一主账号。
+        """
+        uploads_url = self._dashscope_upload_url(base_url)
+        timeout = aiohttp.ClientTimeout(total=600, connect=15)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with session.get(
+                uploads_url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                params={"action": "getPolicy", "model": model},
+            ) as resp:
+                raw = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f"getPolicy HTTP {resp.status}: {raw[:300]}")
+                policy = (json.loads(raw) or {}).get("data") or {}
+            required = ("upload_host", "upload_dir", "oss_access_key_id", "signature", "policy")
+            missing = [key for key in required if not policy.get(key)]
+            if missing:
+                raise RuntimeError(f"getPolicy 返回缺少字段: {missing}")
+
+            key = f"{str(policy['upload_dir']).rstrip('/')}/{video_path.name}"
+            form = aiohttp.FormData()
+            form.add_field("OSSAccessKeyId", str(policy["oss_access_key_id"]))
+            form.add_field("Signature", str(policy["signature"]))
+            form.add_field("policy", str(policy["policy"]))
+            form.add_field("x-oss-object-acl", str(policy.get("x_oss_object_acl", "private")))
+            form.add_field("x-oss-forbid-overwrite", str(policy.get("x_oss_forbid_overwrite", "true")))
+            form.add_field("key", key)
+            form.add_field("success_action_status", "200")
+            with video_path.open("rb") as handle:
+                form.add_field("file", handle, filename=video_path.name, content_type="application/octet-stream")
+                async with session.post(str(policy["upload_host"]), data=form) as resp:
+                    if resp.status not in (200, 204):
+                        raise RuntimeError(f"OSS 上传 HTTP {resp.status}: {(await resp.text())[:300]}")
+        return f"oss://{key}"
 
     async def _resolve_qwen_config(self, event: AstrMessageEvent) -> tuple[str, str, str, int, dict]:
         provider = None
@@ -495,10 +571,13 @@ class VideoSummaryPlugin(Star):
             raise RuntimeError("Qwen API key 未配置；请填写 qwen.api_key 或 qwen.provider_id。")
         return api_key, base_url.rstrip("/"), model, timeout, custom_headers
 
-    async def _qwen_chat(self, api_key: str, base_url: str, model: str, timeout_seconds: int, messages: list, custom_headers: dict | None = None) -> str:
+    async def _qwen_chat(self, api_key: str, base_url: str, model: str, timeout_seconds: int, messages: list, custom_headers: dict | None = None, oss_resolve: bool = False) -> str:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if custom_headers:
             headers.update({str(k): str(v) for k, v in custom_headers.items()})
+        if oss_resolve:
+            # 查档：使用 oss:// 临时 URL 时必须显式携带该 Header，否则服务端无法解析。
+            headers["X-DashScope-OssResourceResolve"] = "enable"
         payload = {"model": model, "messages": messages, "modalities": ["text"]}
         if self.qwen_stream:
             payload["stream"] = True
@@ -541,14 +620,59 @@ class VideoSummaryPlugin(Star):
                 content = choices[0].get("message", {}).get("content", "")
                 return content.strip() if isinstance(content, str) else str(content).strip()
 
-    async def _analyze_with_qwen(self, event: AstrMessageEvent, url: str, video_path: Path | None, user_question: str, user_id: str) -> tuple[str, int]:
+    async def _analyze_with_qwen(
+        self,
+        event: AstrMessageEvent,
+        url: str,
+        video_path: Path | None,
+        user_question: str,
+        user_id: str,
+        local_mode: str = "auto",
+    ) -> tuple[str, int]:
+        """local_mode: auto=先临时OSS后base64；oss=只走临时OSS；base64=只走base64。"""
         api_key, base_url, model, timeout, custom_headers = await self._resolve_qwen_config(event)
-        video_ref = url if video_path is None else self._qwen_video_data_url(video_path)
-        messages = [{"role": "user", "content": [
-            {"type": "text", "text": self._build_prompt(user_question)},
-            {"type": "video_url", "video_url": {"url": video_ref}, "fps": self.qwen_fps},
-        ]}]
-        text = await self._qwen_chat(api_key, base_url, model, timeout, messages, custom_headers)
+        prompt = self._build_prompt(user_question)
+
+        async def call(video_ref: str, oss_resolve: bool) -> str:
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "video_url", "video_url": {"url": video_ref}, "fps": self.qwen_fps},
+            ]}]
+            return await self._qwen_chat(
+                api_key, base_url, model, timeout, messages, custom_headers, oss_resolve=oss_resolve
+            )
+
+        if video_path is None:
+            text = await call(url, False)
+        else:
+            raw_size = video_path.stat().st_size
+            want_oss = local_mode == "oss" or (
+                local_mode == "auto"
+                and self.use_temp_oss_upload
+                and raw_size > QWEN_RAW_BASE64_SAFE_BYTES
+            )
+            text = ""
+            oss_error: Exception | None = None
+            if want_oss:
+                try:
+                    oss_url = await self._upload_to_temp_oss(api_key, base_url, model, video_path)
+                    logger.info("[VideoSummary] uploaded to DashScope temp OSS: %s", oss_url)
+                    text = await call(oss_url, True)
+                except Exception as exc:
+                    oss_error = exc
+                    if local_mode == "oss":
+                        raise
+                    logger.warning("[VideoSummary] temp OSS route failed, fallback to base64: %s", exc)
+            if not text:
+                try:
+                    text = await call(self._qwen_video_data_url(video_path), False)
+                except Exception as exc:
+                    if oss_error is not None:
+                        raise RuntimeError(
+                            f"临时OSS上传失败（{type(oss_error).__name__}: {oss_error}）；"
+                            f"base64 亦失败（{type(exc).__name__}: {exc}）"
+                        ) from exc
+                    raise
         if not text:
             raise RuntimeError("Qwen 未返回文本结果")
         used = self._charge_usage(user_id)
@@ -628,7 +752,7 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
         except Exception as exc:
             return "FAIL：" + self._short_error(exc)
 
-    async def _probe_video(self, event: AstrMessageEvent, url: str, direct: bool) -> str:
+    async def _probe_video(self, event: AstrMessageEvent, url: str, direct: bool, local_mode: str = "auto") -> str:
         if not url:
             return "SKIP：未提供 URL"
         task_id = f"diag_{int(time.time() * 1000)}"
@@ -639,9 +763,14 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
                 self.usage.get("users", {}).pop("__diag__", None); self._save_usage()
                 return f"OK：{text[:160] or '<empty>'}"
             video_path, _info = await self._download_video(url, task_id)
-            text, _ = await self._analyze_with_qwen(event, url, video_path, "请用中文用一句话描述这个视频。", "__diag__")
+            size_mb = video_path.stat().st_size / 1024 / 1024
+            if local_mode == "base64" and video_path.stat().st_size > QWEN_RAW_BASE64_SAFE_BYTES:
+                return f"SKIP：本地文件 {size_mb:.1f}MB 超过 base64 安全上限 {QWEN_RAW_BASE64_SAFE_BYTES/1024/1024:.1f}MB"
+            text, _ = await self._analyze_with_qwen(
+                event, url, video_path, "请用中文用一句话描述这个视频。", "__diag__", local_mode=local_mode
+            )
             self.usage.get("users", {}).pop("__diag__", None); self._save_usage()
-            return f"OK：file={video_path.stat().st_size/1024/1024:.1f}MB resp={text[:160] or '<empty>'}"
+            return f"OK：file={size_mb:.1f}MB resp={text[:160] or '<empty>'}"
         except Exception as exc:
             self.usage.get("users", {}).pop("__diag__", None); self._save_usage()
             return "FAIL：" + self._short_error(exc)
@@ -717,7 +846,15 @@ h1 {{ margin:0 0 8px; font-size:28px; }}
         lines.append(f"URL：{url or '未提供'}")
         lines.append("Qwen 文本：" + await self._probe_qwen_text(event))
         lines.append("Qwen 直接视频URL：" + await self._probe_video(event, url, direct=True))
-        lines.append("Qwen 下载后base64视频：" + await self._probe_video(event, url, direct=False))
+        lines.append("Qwen 下载后临时OSS：" + (
+            await self._probe_video(event, url, direct=False, local_mode="oss")
+            if self.use_temp_oss_upload else "SKIP：qwen.use_temp_oss_upload=false"
+        ))
+        lines.append("Qwen 下载后base64：" + await self._probe_video(event, url, direct=False, local_mode="base64"))
+        lines.append(
+            f"百炼上限：base64 编码后 <10MB（原始 ≤{QWEN_RAW_BASE64_SAFE_BYTES/1024/1024:.1f}MB）；"
+            f"URL 方式 Qwen3.5-Omni ≤2GB/1小时。临时OSS端点={self._dashscope_upload_url(self.qwen_base_url)}"
+        )
         if url:
             try:
                 info = await self._extract_info(url)
